@@ -1,19 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V13 "结构判定版"
+V14
 
-V12 -> V13 的改动(详见 README.md):
-  1. 阈值滑杆接进 TWST 黑字分支(V12 里写死 150,滑杆只在 18TRIP 和预览里生效);
-  2. 判定换成"文字行结构"(字形连通域 + 同一基线 + 笔画细),
-     不再用"区块浅色占比" —— 那个判据在明亮背景里几乎永远成立;
-  3. 选项判定改成"圆钮锚定 + 行内有文字",删掉背景(红框)那一整套;
-  4. 切断门槛改成相对值(相对本句峰值),不再依赖固定像素比例;
-  5. 区域改成"内容区百分比",滑杆和数字框都能改;自动去掉上下黑边;
-  6. 进度条显示时间码、可输入跳转、点击跳转,拖动不再重新解码;
-  7. 复核轮:导出后连图带表列出可疑行(默认只报告,可开关自动删除并备份);
-  8. 参数集中在 video_ocr_config.json,改了不用重新编译;
-  9. 版本号/日期由 CI 注入(_build_info.py),窗口标题和 Release 里都能看到。
+V13 -> V14 的改动(详见 README.md):
+  1. 【修】OCR 不再复用事件循环。V13 把 asyncio.run 换成常驻 loop 之后,
+     165 条里 136 条"判定认出了文字但 OCR 返回空" —— 这是最主要的问题,已退回 V12 写法;
+  2. 【修】帧数阈值改成按秒换算:60fps 下"连丢 2 帧"只有 33ms,会把一句台词切得比
+     30fps 碎很多;
+  3. 【修】文字必须坐在"气泡底色"上:笔画周围要够浅够不花(黑字),或够暗(白字)。
+     少了这一条,立绘的头发、护目镜、糖果装饰都会被当成"一行字" ——
+     你那条片子多出来的 20 多条假 [Choice] 就是这么来的;
+  4. OCR 取图分轨道:对话框先喂整个框(V12 一直这么干,最可靠;紧缩图实测会把
+     一句话裁掉一截),选项框先喂紧缩图(顺手把左边圆钮排除),两个都不行就把图
+     存到 _review/ocr_fail/;
+  5. 日志会打出每次 OCR 用了哪块图、读到了什么、读不出时引擎报的什么原因;
+  6. 判定/复核下拉框改成中文;
+  7. 加拖放:视频文件拖进窗口即可加载。
+
+V12 -> V13 的既有改动:阈值滑杆接进 TWST;判定换成"文字行结构"(字形连通域 + 同一
+基线),不再用"区块浅色占比";选项判定改成"圆钮锚定 + 行内有文字",删掉背景红框那一套;
+切断门槛改成相对值;区域改成内容区百分比并自动去黑边;进度条带时间码和输入跳转;
+复核轮(可疑行报告,可选自动删除并备份);参数集中在 video_ocr_config.json。
 
 注意:区域百分比相对"内容区"(去掉黑边之后),不是整帧。
 """
@@ -66,11 +74,11 @@ DEFAULT_CONFIG = {
     "cut_peak_ratio": 0.30,
     "cut_abs_floor": 0.0015,
     "min_dur_dialog": 0.25,
-    "miss_frames_to_cut": 2,
+    "miss_seconds_to_cut": 0.08,
     "motion_cut_after": 0.20,
     "min_dur_choice": 0.50,
-    "choice_still_frames": 8,
-    "choice_absent_frames": 15,
+    "choice_still_seconds": 0.30,
+    "choice_absent_seconds": 0.35,
     "still_diff": 0.001,
     "choice_start_density": 0.004,
     "min_glyphs": 3,
@@ -78,6 +86,11 @@ DEFAULT_CONFIG = {
     "glyph_fill_max": 0.62,
     "glyph_width_cv_min": 0.0,
     "ink_density_max": 0.45,
+    "bg_pale_ratio_min": 0.50,
+    "bg_pale_v_min": 140,
+    "bg_pale_s_max": 90,
+    "bg_dark_ratio_min": 0.40,
+    "bg_dark_v_max": 120,
     "glyph_h_min_ratio": 0.022,
     "glyph_h_max_ratio": 0.14,
     "row_span_min_ratio": 0.25,
@@ -94,6 +107,13 @@ DEFAULT_CONFIG = {
     "detect_mode": "structure",
     "review_mode": "report",
     "ocr_crop_to_text": True,
+    "enable_drag_drop": True,
+    "ocr_crop_pad_ratio": 0.6,
+    "ocr_upscale_min_height": 96,
+    "ocr_upscale_max_scale": 4.0,
+    "ocr_fallback_full_roi": True,
+    "save_failed_crops": True,
+    "save_failed_crops_max": 40,
     "rect_d_pct": [26.0, 79.0, 47.0, 13.0],
     "rect_c_pct": [36.0, 29.0, 32.0, 11.0],
     "sensitivity": 1.3,
@@ -165,6 +185,43 @@ def write_image_unicode(path, img):
     return False
 
 
+def tight_crop(roi, info, cfg):
+    """按文字行裁一块给 OCR 用,上下留余量,免得变成又长又窄的一条。
+
+    V13 初版这里只留 3 像素,结果 700x40 那种细条 Windows OCR 经常读不出东西;
+    现在按字高的 0.6 倍上下补白,并交给 prepare_ocr_image 放大。
+    """
+    if roi is None or getattr(roi, "size", 0) == 0:
+        return None
+    if not cfg.get("ocr_crop_to_text", True) or not info or not info.get("text_bbox"):
+        return roi.copy()
+    bx, by, bw, bh = info["text_bbox"]
+    pad_y = int(bh * float(cfg.get("ocr_crop_pad_ratio", 0.6))) + 4
+    x0 = max(0, bx - 4)
+    y0 = max(0, by - pad_y)
+    x1 = min(roi.shape[1], bx + bw + 4)
+    y1 = min(roi.shape[0], by + bh + pad_y)
+    if x1 <= x0 or y1 <= y0:
+        return roi.copy()
+    return roi[y0:y1, x0:x1].copy()
+
+
+def prepare_ocr_image(crop, cfg):
+    """小图放大再送 OCR(Windows OCR 对几十像素高的图很不友好)。"""
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return crop
+    min_h = int(cfg.get("ocr_upscale_min_height", 96))
+    if min_h <= 0:
+        return crop
+    height, width = crop.shape[:2]
+    if height >= min_h or height <= 0:
+        return crop
+    scale = min(float(cfg.get("ocr_upscale_max_scale", 4.0)),
+                max(2.0, min_h / float(height)))
+    return cv2.resize(crop, (max(1, int(width * scale)), max(1, int(height * scale))),
+                      interpolation=cv2.INTER_CUBIC)
+
+
 def _ink_mask(gray, dark_on_light, thr, local_contrast):
     """二值化 + 局部对比过滤:只有比周围明显暗(或亮)的细东西才算笔画。"""
     height = gray.shape[0]
@@ -204,6 +261,7 @@ def analyze_text(roi, dark_on_light, thr, content_h, cfg, prev_mask=None):
     info = {
         "ok": False, "nglyph": 0, "glyph_h": 0.0, "ink_density": density,
         "diff_score": diff, "mask": ink, "text_bbox": None,
+        "bg_pale": 0.0, "bg_dark": 0.0,
     }
     if density > cfg["ink_density_max"] * 1.6:
         return info
@@ -267,6 +325,39 @@ def analyze_text(roi, dark_on_light, thr, content_h, cfg, prev_mask=None):
 
     ys0 = min(it[1] for it in items)
     ys1 = max(it[1] + it[3] for it in items)
+
+    # 关键的一条:文字得坐在"气泡底色"上。
+    # 黑字(TWST) → 笔画周围要够浅、不花;白字/章节卡 → 周围要够暗。
+    # 少了这一条,立绘的头发、护目镜、糖果装饰都会被当成"一行字"。
+    y_lo = max(0, ys0 - 2)
+    y_hi = ys1 + 3
+    x_lo = max(0, xs0 - 2)
+    x_hi = xs1 + 3
+    bg_pale = 0.0
+    bg_dark = 0.0
+    try:
+        sub = roi[y_lo:y_hi, x_lo:x_hi].astype(np.int16)
+        sub_ink = ink[y_lo:y_hi, x_lo:x_hi]
+        mx = sub.max(axis=2)
+        mn = sub.min(axis=2)
+        sat = np.where(mx > 0, (mx - mn) * 255 // np.maximum(mx, 1), 0)
+        pale = (sat < cfg["bg_pale_s_max"]) & (mx >= cfg["bg_pale_v_min"])
+        darkpx = mx <= cfg["bg_dark_v_max"]
+        bgmask = sub_ink == 0
+        if int(bgmask.sum()) > 20:
+            bg_pale = float(pale[bgmask].mean())
+            bg_dark = float(darkpx[bgmask].mean())
+    except Exception:
+        pass
+    info["bg_pale"] = bg_pale
+    info["bg_dark"] = bg_dark
+    if dark_on_light:
+        if bg_pale < cfg["bg_pale_ratio_min"]:
+            return info
+    else:
+        if bg_dark < cfg["bg_dark_ratio_min"]:
+            return info
+
     info["ok"] = True
     info["nglyph"] = len(items)
     info["glyph_h"] = med_h
@@ -376,22 +467,15 @@ def detect_content_area(frames, width, height):
 
 # ---- 以下为主程序部分(App / 主流程 / 复核) ----
 
-_tls = threading.local()
-
-
-def _thread_loop():
-    """OCR 复用同一个事件循环(别每句都 asyncio.run 新建一次)。"""
-    loop = getattr(_tls, "loop", None)
-    if loop is None or loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        _tls.loop = loop
-    return loop
+# 说明:OCR 每次调用都新建事件循环(asyncio.run)。
+# V13 里改成"复用同一个事件循环"之后,Windows OCR 大部分时候返回空字符串
+# (实测 165 条里 136 条拿不到文本),所以退回 V12 的写法。
 
 
 class VideoProcessor:
     def __init__(self, logger):
         self.ocr_engine = None
+        self.last_error = ""
         self.logger = logger
         if HAS_WIN_OCR:
             try:
@@ -406,6 +490,7 @@ class VideoProcessor:
 
     async def _run_win_ocr(self, cv2_img):
         if not self.ocr_engine:
+            self.last_error = "OCR引擎未初始化"
             return ""
         try:
             bgra = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2BGRA)
@@ -418,16 +503,29 @@ class VideoProcessor:
             )
             result = await self.ocr_engine.recognize_async(bitmap)
             return result.text.replace(" ", "")
-        except Exception:
+        except Exception as exc:
+            self.last_error = "%s: %s" % (type(exc).__name__, exc)
             return ""
 
     def ocr_image(self, img):
-        if not HAS_WIN_OCR or img is None or img.size == 0:
+        """返回识别到的文本;失败原因记在 self.last_error 里(方便排查)。"""
+        self.last_error = ""
+        if not HAS_WIN_OCR:
+            self.last_error = "winsdk 不可用"
+            return ""
+        if img is None or getattr(img, "size", 0) == 0:
+            self.last_error = "图片为空"
             return ""
         try:
-            return _thread_loop().run_until_complete(self._run_win_ocr(img))
-        except Exception:
+            text = asyncio.run(self._run_win_ocr(img))
+        except Exception as exc:
+            self.last_error = "%s: %s" % (type(exc).__name__, exc)
             return ""
+        if not text and not self.last_error:
+            self.last_error = "引擎没报错但结果为空"
+        elif text and len(text.strip()) < 2:
+            self.last_error = "结果太短: %r" % text[:20]
+        return text
 
 
 class Rec:
@@ -448,6 +546,65 @@ class Rec:
         self.i0 = 0
         self.i1 = 0
         self.reason = []
+
+
+def install_drop_target(root, on_files):
+    """让窗口能接收"把文件拖进来"(Win32 WM_DROPFILES,不需要额外依赖)。
+
+    失败就静默放弃,不影响其它功能。回调必须留引用,否则会被 Python 回收。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+        USER32_PTR = ctypes.c_ssize_t
+        user32.GetWindowLongPtrW.restype = USER32_PTR
+        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowLongPtrW.restype = USER32_PTR
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, USER32_PTR]
+        user32.CallWindowProcW.restype = USER32_PTR
+        user32.CallWindowProcW.argtypes = [USER32_PTR, wintypes.HWND, ctypes.c_uint,
+                                           USER32_PTR, USER32_PTR]
+        shell32.DragQueryFileW.argtypes = [USER32_PTR, ctypes.c_uint,
+                                           ctypes.c_wchar_p, ctypes.c_uint]
+        shell32.DragQueryFileW.restype = ctypes.c_uint
+        shell32.DragFinish.argtypes = [USER32_PTR]
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+
+        root.update_idletasks()
+        hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+        wm_dropfiles = 0x0233
+        gwlp_wndproc = -4
+        proc_type = ctypes.WINFUNCTYPE(USER32_PTR, wintypes.HWND, ctypes.c_uint,
+                                       USER32_PTR, USER32_PTR)
+        old_proc = user32.GetWindowLongPtrW(hwnd, gwlp_wndproc)
+
+        def handler(h, msg, wparam, lparam):
+            if msg == wm_dropfiles:
+                try:
+                    count = shell32.DragQueryFileW(wparam, 0xFFFFFFFF, None, 0)
+                    files = []
+                    for i in range(count):
+                        buf = ctypes.create_unicode_buffer(1024)
+                        if shell32.DragQueryFileW(wparam, i, buf, 1024):
+                            files.append(buf.value)
+                    shell32.DragFinish(wparam)
+                    if files:
+                        root.after(10, lambda f=files: on_files(f))
+                except Exception:
+                    pass
+                return 0
+            return user32.CallWindowProcW(old_proc, h, msg, wparam, lparam)
+
+        proc = proc_type(handler)
+        user32.SetWindowLongPtrW(hwnd, gwlp_wndproc, ctypes.cast(proc, USER32_PTR))
+        shell32.DragAcceptFiles(hwnd, True)
+        root._drop_proc = proc
+        return True
+    except Exception:
+        return False
 
 
 class App:
@@ -473,8 +630,13 @@ class App:
 
         self._setup_ui()
         self.processor = VideoProcessor(self.log)
+        if self.cfg.get("enable_drag_drop", True):
+            self.drop_ok = install_drop_target(self.root, self._on_drop_files)
+        else:
+            self.drop_ok = False
         self.log("ℹ️ 版本 %s / 构建 %s" % (APP_VERSION, BUILD_DATE))
         self.log("ℹ️ 参数文件: %s" % os.path.join(app_dir(), "video_ocr_config.json"))
+        self.log("ℹ️ 拖拽: %s" % ("已启用" if self.drop_ok else "不可用(用按钮加载也一样)"))
         self.root.after(120, self._drain_log)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -525,15 +687,19 @@ class App:
         tk.Radiobutton(f_top2, text="18TRIP (白字)", variable=self.var_mode,
                        value="WHITE").pack(side=tk.LEFT, padx=10)
 
-        self.var_detect = tk.StringVar(value=self.cfg["detect_mode"])
+        init_detect = ("结构判定" if str(self.cfg.get("detect_mode", "structure")).startswith("str")
+                       else "传统判定")
+        self.var_detect = tk.StringVar(value=init_detect)
         tk.Label(f_top2, text="判定:").pack(side=tk.LEFT, padx=(14, 2))
-        ttk.Combobox(f_top2, textvariable=self.var_detect, width=9, state="readonly",
-                     values=("structure", "legacy")).pack(side=tk.LEFT)
+        ttk.Combobox(f_top2, textvariable=self.var_detect, width=10, state="readonly",
+                     values=("结构判定", "传统判定")).pack(side=tk.LEFT)
 
-        self.var_review = tk.StringVar(value=self.cfg["review_mode"])
+        init_review = {"off": "关闭", "report": "只报告", "report+delete": "报告并删除"}.get(
+            str(self.cfg.get("review_mode", "report")), "只报告")
+        self.var_review = tk.StringVar(value=init_review)
         tk.Label(f_top2, text="复核:").pack(side=tk.LEFT, padx=(14, 2))
-        ttk.Combobox(f_top2, textvariable=self.var_review, width=12, state="readonly",
-                     values=("off", "report", "report+delete")).pack(side=tk.LEFT)
+        ttk.Combobox(f_top2, textvariable=self.var_review, width=10, state="readonly",
+                     values=("关闭", "只报告", "报告并删除")).pack(side=tk.LEFT)
 
         self.var_ocr = tk.BooleanVar(value=False)
         cb_ocr = tk.Checkbutton(f_top2, text="启用 OCR", variable=self.var_ocr,
@@ -558,6 +724,9 @@ class App:
         f_mid.add(canvas_frame, stretch="always")
         self.canvas = tk.Canvas(canvas_frame, bg="black")
         self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.create_text(440, 180,
+                                text="把视频文件拖到这里\n（或点左上角「📂 加载视频」）",
+                                fill="#8a8a8a", font=("微软雅黑", 16), tags="hint")
 
         f_log = tk.Frame(f_mid)
         f_mid.add(f_log, width=380)
@@ -677,6 +846,21 @@ class App:
         path = filedialog.askopenfilename()
         if not path:
             return
+        self.open_video(path)
+
+    def _on_drop_files(self, files):
+        """拖进来的文件:第一个认识的视频就打开。"""
+        exts = (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m4v", ".webm")
+        for path in files:
+            if str(path).lower().endswith(exts):
+                self.open_video(path)
+                return
+        self.log("⚠️ 拖进来的不是认识的视频格式: %s" % (files[0] if files else ""))
+
+    def open_video(self, path):
+        if self.is_processing:
+            self.log("⚠️ 正在处理中,先按「停止」再换视频")
+            return
         self.video_path = path
         if self.cap:
             self.cap.release()
@@ -715,6 +899,10 @@ class App:
         self.lbl_content.config(text="内容区: %d,%d %dx%d" % (cx, cy, cw, chh))
         self.log("📂 已加载: %s" % path)
         self.log("ℹ️ 内容区(去黑边后) = (%d, %d) %d x %d" % (cx, cy, cw, chh))
+        low_dir = app_dir().lower()
+        if "rar$" in low_dir or "\\temp\\" in low_dir or low_dir.endswith("\\temp"):
+            self.log("⚠️ 程序现在跑在临时目录里,参数文件和复核结果可能被清掉")
+            self.log("   → 建议把 zip 解压到固定文件夹再运行(例如 D:\\VideoOCR)")
         self.preview_cache = (None, None)
         self.preview_index = 0
         self.s_time.set(0.0)
@@ -831,8 +1019,10 @@ class App:
             thr = float(self.s_bin.get())
             p_diff = float(self.s_diff.get()) / 100.0
             do_ocr = bool(self.var_ocr.get())
-            use_structure = (self.var_detect.get() == "structure")
-            review_mode = self.var_review.get()
+            use_structure = (self.var_detect.get() != "传统判定")
+            review_mode = {"关闭": "off", "只报告": "report",
+                           "报告并删除": "report+delete"}.get(
+                               self.var_review.get(), "report")
             verbose = bool(self.var_verbose.get())
             require_anchor = dark_on_light or bool(cfg["require_anchor_in_white_mode"])
 
@@ -842,37 +1032,68 @@ class App:
                 return
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = self.fps if self.fps > 0 else 30.0
+            # 帧数和时间的关系跟帧率有关:60fps 下"2 帧"只有 33ms,所以统一按秒换算,
+            # 否则 60fps 的素材会被切得比 30fps 碎很多。
+            f_miss = max(2, int(round(cfg["miss_seconds_to_cut"] * fps)))
+            f_still = max(3, int(round(cfg["choice_still_seconds"] * fps)))
+            f_absent = max(3, int(round(cfg["choice_absent_seconds"] * fps)))
+            self.log("ℹ️ 帧率 %.2ffps → 连丢 %d 帧算一句结束 / 静止 %d 帧上锁 / 消失 %d 帧结算"
+                     % (fps, f_miss, f_still, f_absent))
             recs = []
+            base = os.path.splitext(self.video_path)[0]
+            fail_dir = os.path.join(base + "_review", "ocr_fail")
+            fail_count = [0]
+            err_logged = [0]
             self.log("ℹ️ 对话框(像素) %s / 选项框(像素) %s" % (rect_d, rect_c))
             self.log("ℹ️ 判定=%s 阈值=%d 防连读=%.1f OCR=%s" % (
                 self.var_detect.get(), int(thr), self.s_diff.get(), "开" if do_ocr else "关"))
 
-            def ocr_of(crop, fallback):
-                if not do_ocr or crop is None or crop.size == 0:
-                    return False, fallback
-                try:
-                    text = self.processor.ocr_image(crop)
-                except Exception:
-                    text = ""
-                if text and len(text.strip()) >= 2:
-                    return True, text.strip()
-                return False, fallback
+            def ocr_of(roi, info, fallback, prefer):
+                """给 OCR 的图,按 prefer 决定先试哪个。
 
-            def pick_crop(roi, info):
-                """送给 OCR 的图:默认只给"文字行"那一块,圆钮/名牌自然被排除。"""
-                if roi is None:
-                    return None
-                if not cfg["ocr_crop_to_text"] or not info or not info.get("text_bbox"):
-                    return roi.copy()
-                bx, by, bw, bh = info["text_bbox"]
-                pad = 3
-                x0 = max(0, bx - pad)
-                y0 = max(0, by - pad)
-                x1 = min(roi.shape[1], bx + bw + pad)
-                y1 = min(roi.shape[0], by + bh + pad)
-                if x1 <= x0 or y1 <= y0:
-                    return roi.copy()
-                return roi[y0:y1, x0:x1].copy()
+                对话框 prefer="roi":V12 一直把整个框喂给 OCR(你那边 95% 能读出来);
+                紧缩图实测会把一句话裁掉一截(比如"誰もいないコース。消え"这种),
+                所以整个框优先,紧缩图只当备胎。
+                选项框 prefer="tight":紧缩图正好把左边那个圆钮排除在外,
+                免得被识别成怪字;读不出再退回整个框。
+                两个都不行就把图存到 _review/ocr_fail/,方便回头看是什么样。
+                """
+                if not do_ocr or roi is None or roi.size == 0:
+                    return False, fallback, roi
+                tight = tight_crop(roi, info, cfg)
+                if prefer == "tight":
+                    cands = [("tight", tight), ("roi", roi)]
+                else:
+                    cands = [("roi", roi), ("tight", tight)]
+                tried = []
+                for tag, cand in cands:
+                    if cand is None or getattr(cand, "size", 0) == 0:
+                        continue
+                    shape = (int(cand.shape[0]), int(cand.shape[1]))
+                    if shape in tried:
+                        continue          # 整个框和紧缩图一样大时不用试两遍
+                    tried.append(shape)
+                    text = self.processor.ocr_image(prepare_ocr_image(cand, cfg))
+                    if text and len(text.strip()) >= 2:
+                        if verbose:
+                            self.log("   ✎ OCR(%s %dx%d): %s" % (
+                                tag, shape[1], shape[0], text.strip()[:36]))
+                        return True, text.strip(), cand
+                    if self.processor.last_error and err_logged[0] < 8:
+                        err_logged[0] += 1
+                        self.log("⚠️ OCR没读出(%s, %dx%d): %s" % (
+                            tag, shape[1], shape[0], self.processor.last_error))
+                if (cfg.get("save_failed_crops", True)
+                        and fail_count[0] < int(cfg.get("save_failed_crops_max", 40))):
+                    fail_count[0] += 1
+                    shot = tight if (tight is not None and tight.size) else roi
+                    try:
+                        os.makedirs(fail_dir, exist_ok=True)
+                        write_image_unicode(
+                            os.path.join(fail_dir, "fail%03d.jpg" % fail_count[0]), shot)
+                    except Exception:
+                        pass
+                return False, fallback, roi
 
             # 对话轨状态
             d_active = False
@@ -881,7 +1102,8 @@ class App:
             d_miss = 0
             d_glyph_max = 0
             d_best_density = 0.0
-            d_best_crop = None
+            d_best_roi = None
+            d_best_info = None
             d_mask_prev = None
 
             # 选项轨状态
@@ -892,8 +1114,10 @@ class App:
             c_still = 0
             c_glyph_max = 0
             c_best_density = 0.0
-            c_best_crop = None
-            c_fallback_crop = None
+            c_best_roi = None
+            c_best_info = None
+            c_fallback_roi = None
+            c_fallback_info = None
             c_mask_prev = None
             c_anchor_seen = False
 
@@ -933,20 +1157,22 @@ class App:
                             d_miss = 0
                             d_glyph_max = d_info["nglyph"]
                             d_best_density = density
-                            d_best_crop = pick_crop(roi_d, d_info)
+                            d_best_roi = roi_d.copy()
+                            d_best_info = d_info
                     else:
                         if has_text:
                             d_miss = 0
                             d_peak = max(d_peak, density)
                             if density > d_best_density + 0.001:
                                 d_best_density = density
-                                d_best_crop = pick_crop(roi_d, d_info)
+                                d_best_roi = roi_d.copy()
+                                d_best_info = d_info
                             d_glyph_max = max(d_glyph_max, d_info["nglyph"])
                         else:
                             d_miss += 1
 
                         should_cut = False
-                        if d_miss >= int(cfg["miss_frames_to_cut"]):
+                        if d_miss >= f_miss:
                             should_cut = True
                         elif density < max(cfg["cut_abs_floor"],
                                            d_peak * cfg["cut_peak_ratio"]):
@@ -960,9 +1186,10 @@ class App:
                             if dur > cfg["min_dur_dialog"]:
                                 st = datetime.timedelta(seconds=d_start / fps)
                                 et = datetime.timedelta(seconds=idx / fps)
-                                ocr_ok, content_d = ocr_of(d_best_crop, "Line [Dialog]")
+                                ocr_ok, content_d, used_d = ocr_of(
+                                    d_best_roi, d_best_info, "Line [Dialog]", "roi")
                                 rec = Rec(st, et, content_d, "dialog")
-                                rec.crop = d_best_crop
+                                rec.crop = used_d
                                 rec.nglyph = d_glyph_max
                                 rec.ocr_ok = ocr_ok
                                 rec.i0, rec.i1 = d_start, idx
@@ -987,13 +1214,15 @@ class App:
                                 d_miss = 0
                                 d_glyph_max = d_info["nglyph"]
                                 d_best_density = density
-                                d_best_crop = pick_crop(roi_d, d_info)
+                                d_best_roi = roi_d.copy()
+                                d_best_info = d_info
                             else:
                                 d_active = False
                                 d_peak = 0.0
                                 d_glyph_max = 0
                                 d_best_density = 0.0
-                                d_best_crop = None
+                                d_best_roi = None
+                                d_best_info = None
 
                 # ---------- 选项轨 ----------
                 xc, yc, wc, hc = rect_c
@@ -1031,8 +1260,10 @@ class App:
                             c_still = 0
                             c_glyph_max = c_info["nglyph"]
                             c_best_density = density_c
-                            c_best_crop = None
-                            c_fallback_crop = pick_crop(roi_c, c_info)
+                            c_best_roi = None
+                            c_best_info = None
+                            c_fallback_roi = roi_c.copy()
+                            c_fallback_info = c_info
                     else:
                         if is_choice:
                             c_empty = 0
@@ -1040,32 +1271,39 @@ class App:
                                 c_best_density = density_c
                                 c_glyph_max = max(c_glyph_max, c_info["nglyph"])
                                 if not c_locked:
-                                    c_fallback_crop = pick_crop(roi_c, c_info)
+                                    c_fallback_roi = roi_c.copy()
+                                    c_fallback_info = c_info
                             if not c_locked:
                                 if diff_c < cfg["still_diff"]:
                                     c_still += 1
-                                    if c_still >= int(cfg["choice_still_frames"]):
-                                        c_best_crop = pick_crop(roi_c, c_info)
+                                    if c_still >= f_still:
+                                        c_best_roi = roi_c.copy()
+                                        c_best_info = c_info
                                         c_locked = True
                                         self.log("📸[选项快门] 发现完美静止画面，锁定！")
                                 else:
                                     c_still = 0
                         else:
                             c_empty += 1
-                            if c_empty > int(cfg["choice_absent_frames"]):
+                            if c_empty > f_absent:
                                 c_active = False
-                                real_end = max(c_start,
-                                               idx - int(cfg["choice_absent_frames"]))
+                                real_end = max(c_start, idx - f_absent)
                                 dur_c = (real_end - c_start) / fps
                                 if dur_c > cfg["min_dur_choice"]:
                                     st_c = datetime.timedelta(seconds=c_start / fps)
                                     et_c = datetime.timedelta(seconds=real_end / fps)
-                                    target = c_best_crop if c_locked else c_fallback_crop
-                                    ocr_ok_c, content_c = ocr_of(target, "Line [Choice]")
+                                    if c_locked:
+                                        target_roi, target_info = c_best_roi, c_best_info
+                                    else:
+                                        target_roi, target_info = (c_fallback_roi,
+                                                                   c_fallback_info)
+                                    ocr_ok_c, content_c, used_c = ocr_of(
+                                        target_roi, target_info, "Line [Choice]",
+                                        "tight")
                                     if ocr_ok_c:
                                         content_c = "%s [Choice]" % content_c
                                     rec = Rec(st_c, et_c, content_c, "choice")
-                                    rec.crop = target
+                                    rec.crop = used_c
                                     rec.nglyph = c_glyph_max
                                     rec.ocr_ok = ocr_ok_c
                                     rec.anchor = c_anchor_seen
