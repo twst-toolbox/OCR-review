@@ -1,9 +1,25 @@
-[README.md](https://github.com/user-attachments/files/33306651/README.md)
-# Video Subtitle Extractor V14
+[README.md](https://github.com/user-attachments/files/33307617/README.md)
+# Video Subtitle Extractor V15
 
-TWST / 18T 打轴 & Windows 自带 OCR 辨识。V14 是**修 V13 那两个 bug** 的版本。
+TWST / 18T 打轴 & Windows 自带 OCR 辨识。
 
-## V14 修了什么(对着你上一轮的反馈)
+## V15 修了什么(对着你上一轮反馈的三件事)
+
+1. **拖放失效** —— `install_drop_target` 里 ctypes 把函数指针 `cast` 成 `c_ssize_t`，
+   而 `cast` 的第二个参数必须是指针类型，于是直接抛异常、拖放整块失效
+   （日志里那句 `⚠️ 拖拽: 不可用(用按钮加载也一样)` 就是它）。已改成 `c_void_p`，
+   并补上 `GetParent` 的 restype（不然 64 位下句柄会被截断）。
+2. **碎句（同一句被切成两三条）** —— 这是打字机效果 + 灵敏度 1.3 共同造成的：
+   每多打出一个字，ROI 里的墨水就变一次，超过 1.3% 就触发"变化切断"。
+   现在**墨水正在增长的那些帧不算换句**，要连续 3 帧墨水不再增长才允许按画面变化切断。
+   同时把"缝合"从"必须完全相等"放宽成**开头 70% 一致就合并，并保留更长的那句**。
+3. **选项还是一堆无效行** —— 我把你 `_review/ocr_fail/` 里那 40 张失败图拼出来看了：
+   **全是糖果装饰、背景和立绘**（护目镜、脸、黑影人物），**一张有文字的都没有**。
+   所以选项改成：**锁定那一刻就试一次 OCR**，读不出字说明这不是真选项（立绘能骗过形状
+   判定，但骗不过 OCR），**不锁定、继续等下一个静止瞬间**；整段都读不出文字就直接丢弃，
+   不再输出 `Line N [Choice]`。真选项（比如 1:13 那处）会被读出来并保留。
+
+## 上一版(V14)修了什么
 
 1. **"OCR 看不到、丢失很多"** —— 找到了：V13 我把 OCR 的 `asyncio.run` 改成"复用同一个
    事件循环"，结果 Windows OCR 大部分时候返回空字符串。你那份复核报告里
@@ -60,6 +76,11 @@ TWST / 18T 打轴 & Windows 自带 OCR 辨识。V14 是**修 V13 那两个 bug**
 
 ## 参数速查（exe 旁边的 video_ocr_config.json，改完重启即可，不用重新编译）
 
+- `drop_unreadable_choice`（true）：选项段读不出文字就丢掉。**假选项多就保持 true**；
+  万一真选项被丢掉（日志里会有 `🗑️ 丢弃…` 那行），改成 false 就退回输出占位行。
+- `motion_cut_stable_frames`（3）：墨水连续几帧不再增长才允许按画面变化切断。
+  调大 = 打字机更难切碎（代价是换句反应迟钝一点）。
+- `merge_prefix_ratio`（0.7）：相邻两条台词开头有多少比例一致就合并成一条。
 - `bg_pale_ratio_min`（0.5）：文字周围要多"浅色"才算坐在气泡上。假 choice 多就往上调
   （0.6~0.7），真台词漏检就往下调（0.35）。
 - `bg_pale_v_min`（140）/ `bg_pale_s_max`（90）：上面那条"浅色"的定义，跟着游戏配色调。
