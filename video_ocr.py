@@ -1,0 +1,1224 @@
+# -*- coding: utf-8 -*-
+"""
+Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
+V13 "结构判定版"
+
+V12 -> V13 的改动(详见 README.md):
+  1. 阈值滑杆接进 TWST 黑字分支(V12 里写死 150,滑杆只在 18TRIP 和预览里生效);
+  2. 判定换成"文字行结构"(字形连通域 + 同一基线 + 笔画细),
+     不再用"区块浅色占比" —— 那个判据在明亮背景里几乎永远成立;
+  3. 选项判定改成"圆钮锚定 + 行内有文字",删掉背景(红框)那一整套;
+  4. 切断门槛改成相对值(相对本句峰值),不再依赖固定像素比例;
+  5. 区域改成"内容区百分比",滑杆和数字框都能改;自动去掉上下黑边;
+  6. 进度条显示时间码、可输入跳转、点击跳转,拖动不再重新解码;
+  7. 复核轮:导出后连图带表列出可疑行(默认只报告,可开关自动删除并备份);
+  8. 参数集中在 video_ocr_config.json,改了不用重新编译;
+  9. 版本号/日期由 CI 注入(_build_info.py),窗口标题和 Release 里都能看到。
+
+注意:区域百分比相对"内容区"(去掉黑边之后),不是整帧。
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime
+import json
+import os
+import queue
+import sys
+import threading
+import traceback
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import cv2
+import numpy as np
+import srt
+from PIL import Image, ImageTk
+
+try:
+    from _build_info import APP_VERSION, BUILD_DATE
+except Exception:
+    APP_VERSION, BUILD_DATE = "V13-dev", "2026-10-11"
+
+APP_NAME = "Video Subtitle Extractor"
+
+HAS_WIN_OCR = False
+try:
+    from winsdk.windows.media.ocr import OcrEngine
+    from winsdk.windows.globalization import Language
+    from winsdk.windows.graphics.imaging import SoftwareBitmap, BitmapPixelFormat
+    import winsdk.windows.storage.streams as streams
+
+    HAS_WIN_OCR = True
+except ImportError:
+    print("未安装 winsdk 库或不在 Windows 环境")
+
+
+# 参数第一次运行会写成 exe 旁边的 video_ocr_config.json,之后直接改 json 就生效,
+# 不用重新编译。删掉 json 会重新生成默认值。
+DEFAULT_CONFIG = {
+    "bin_threshold_twst": 175,
+    "bin_threshold_white": 130,
+    "bin_threshold_min": 110,
+    "bin_threshold_max": 240,
+    "text_start_density": 0.004,
+    "cut_peak_ratio": 0.30,
+    "cut_abs_floor": 0.0015,
+    "min_dur_dialog": 0.25,
+    "miss_frames_to_cut": 2,
+    "motion_cut_after": 0.20,
+    "min_dur_choice": 0.50,
+    "choice_still_frames": 8,
+    "choice_absent_frames": 15,
+    "still_diff": 0.001,
+    "choice_start_density": 0.004,
+    "min_glyphs": 3,
+    "glyph_fill_min": 0.12,
+    "glyph_fill_max": 0.62,
+    "glyph_width_cv_min": 0.0,
+    "ink_density_max": 0.45,
+    "glyph_h_min_ratio": 0.022,
+    "glyph_h_max_ratio": 0.14,
+    "row_span_min_ratio": 0.25,
+    "local_contrast": 18,
+    "try_opposite_polarity": True,
+    "anchor_search_left": 1.2,
+    "anchor_search_updown": 0.9,
+    "anchor_aspect_min": 0.65,
+    "anchor_aspect_max": 1.55,
+    "anchor_fill_min": 0.55,
+    "anchor_h_min_ratio": 0.035,
+    "anchor_h_max_ratio": 0.20,
+    "require_anchor_in_white_mode": False,
+    "detect_mode": "structure",
+    "review_mode": "report",
+    "ocr_crop_to_text": True,
+    "rect_d_pct": [26.0, 79.0, 47.0, 13.0],
+    "rect_c_pct": [36.0, 29.0, 32.0, 11.0],
+    "sensitivity": 1.3,
+}
+
+
+def app_dir():
+    if "__compiled__" in globals() or getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    path = os.path.join(app_dir(), "video_ocr_config.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                cfg.update(json.load(fp))
+        except Exception:
+            pass
+    else:
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(cfg, fp, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return cfg
+
+
+def fmt_timecode(seconds):
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    rest = seconds % 60
+    if hours:
+        return "%d:%02d:%04.1f" % (hours, minutes, rest)
+    return "%02d:%04.1f" % (minutes, rest)
+
+
+def parse_timecode(text, total_seconds):
+    text = (text or "").strip().replace("：", ":")
+    if not text:
+        return None
+    try:
+        parts = text.split(":")
+        if len(parts) > 3:
+            return None
+        value = 0.0
+        for part in parts:
+            value = value * 60.0 + float(part)
+        if value < 0:
+            return None
+        return min(value, total_seconds)
+    except Exception:
+        return None
+
+
+def write_image_unicode(path, img):
+    """cv2.imwrite 碰到中文路径会静默失败,用 imencode + tofile 绕开。"""
+    try:
+        ext = os.path.splitext(path)[1] or ".jpg"
+        ok, buf = cv2.imencode(ext, img)
+        if ok:
+            buf.tofile(path)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _ink_mask(gray, dark_on_light, thr, local_contrast):
+    """二值化 + 局部对比过滤:只有比周围明显暗(或亮)的细东西才算笔画。"""
+    height = gray.shape[0]
+    ksize = max(5, int(round(height * 0.7)) | 1)
+    bg = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+    g16 = gray.astype(np.int16)
+    b16 = bg.astype(np.int16)
+    if dark_on_light:
+        local = b16 - g16
+        _, ink = cv2.threshold(gray, int(thr), 255, cv2.THRESH_BINARY_INV)
+    else:
+        local = g16 - b16
+        _, ink = cv2.threshold(gray, int(thr), 255, cv2.THRESH_BINARY)
+    gate = (local > int(local_contrast)).astype(np.uint8) * 255
+    return cv2.bitwise_and(ink, gate)
+
+
+def analyze_text(roi, dark_on_light, thr, content_h, cfg, prev_mask=None):
+    """在 roi(BGR) 里判断有没有一行文字。
+
+    返回 dict: ok / nglyph / glyph_h / ink_density / diff_score / mask / text_bbox
+    """
+    if roi is None or getattr(roi, "size", 0) == 0:
+        return None
+    height, width = roi.shape[:2]
+    if width < 8 or height < 6:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    ink = _ink_mask(gray, dark_on_light, thr, cfg["local_contrast"])
+    dil = cv2.dilate(ink, np.ones((3, 3), np.uint8), iterations=1)
+    density = cv2.countNonZero(dil) / float(width * height)
+    diff = 0.0
+    if prev_mask is not None and prev_mask.shape == ink.shape:
+        diff = cv2.countNonZero(cv2.absdiff(ink, prev_mask)) / float(width * height)
+
+    info = {
+        "ok": False, "nglyph": 0, "glyph_h": 0.0, "ink_density": density,
+        "diff_score": diff, "mask": ink, "text_bbox": None,
+    }
+    if density > cfg["ink_density_max"] * 1.6:
+        return info
+
+    try:
+        count, _labels, stats, _cents = cv2.connectedComponentsWithStats(ink, 8)
+    except Exception:
+        return info
+
+    boxes = []
+    for i in range(1, count):
+        x, y, bw, bh, area = (int(stats[i][j]) for j in range(5))
+        if area < 12 or bh < 6 or bw < 2:
+            continue
+        aspect = bw / float(bh)
+        if aspect < 0.10 or aspect > 2.4:
+            continue
+        fill = area / float(bw * bh)
+        if fill < cfg["glyph_fill_min"] or fill > cfg["glyph_fill_max"]:
+            continue
+        boxes.append((x, y, bw, bh))
+
+    if len(boxes) < max(2, int(cfg["min_glyphs"]) - 1):
+        return info
+
+    med_h = float(np.median([b[3] for b in boxes]))
+    if med_h < max(6.0, cfg["glyph_h_min_ratio"] * content_h):
+        return info
+    if med_h > cfg["glyph_h_max_ratio"] * content_h:
+        return info
+
+    keep = [b for b in boxes if 0.55 * med_h <= b[3] <= 1.75 * med_h]
+    if len(keep) < int(cfg["min_glyphs"]):
+        return info
+
+    keep.sort(key=lambda b: b[1] + b[3] / 2.0)
+    rows = []
+    for box in keep:
+        cy = box[1] + box[3] / 2.0
+        for row in rows:
+            if abs(row["cy"] - cy) <= 0.7 * med_h:
+                row["items"].append(box)
+                row["cy"] = sum(it[1] + it[3] / 2.0 for it in row["items"]) / len(row["items"])
+                break
+        else:
+            rows.append({"cy": cy, "items": [box]})
+    rows.sort(key=lambda r: -len(r["items"]))
+    items = rows[0]["items"]
+    if len(items) < int(cfg["min_glyphs"]):
+        return info
+
+    xs0 = min(it[0] for it in items)
+    xs1 = max(it[0] + it[2] for it in items)
+    if (xs1 - xs0) < cfg["row_span_min_ratio"] * width:
+        return info
+
+    if cfg.get("glyph_width_cv_min", 0) > 0:
+        widths = np.array([it[2] for it in items], dtype=np.float64)
+        if widths.mean() > 0 and (widths.std() / widths.mean()) < cfg["glyph_width_cv_min"]:
+            return info
+
+    ys0 = min(it[1] for it in items)
+    ys1 = max(it[1] + it[3] for it in items)
+    info["ok"] = True
+    info["nglyph"] = len(items)
+    info["glyph_h"] = med_h
+    info["text_bbox"] = (xs0, ys0, xs1 - xs0 + 1, ys1 - ys0 + 1)
+    return info
+
+
+def analyze_text_auto(roi, dark_on_light, thr, content_h, cfg, prev_mask=None):
+    """先按设定极性认;认不出且允许的话,反过来再认一次(章节卡那种反极性文字)。"""
+    info = analyze_text(roi, dark_on_light, thr, content_h, cfg, prev_mask)
+    if info and info["ok"]:
+        return info
+    if not cfg.get("try_opposite_polarity", True):
+        return info
+    strict = dict(cfg)
+    strict["min_glyphs"] = int(cfg["min_glyphs"]) + 1
+    alt = analyze_text(roi, not dark_on_light, thr, content_h, strict, prev_mask)
+    if alt and alt["ok"]:
+        return alt
+    return info
+
+
+def legacy_density(roi, dark_on_light, cfg, prev_mask=None):
+    """V12 的老判据(二值化墨水占比),给 detect_mode=legacy 留条后路。"""
+    height, width = roi.shape[:2]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    thr = cfg["bin_threshold_twst"] if dark_on_light else cfg["bin_threshold_white"]
+    if dark_on_light:
+        _, ink = cv2.threshold(gray, int(thr), 255, cv2.THRESH_BINARY_INV)
+    else:
+        _, ink = cv2.threshold(gray, int(thr), 255, cv2.THRESH_BINARY)
+    dil = cv2.dilate(ink, np.ones((3, 3), np.uint8), iterations=1)
+    density = cv2.countNonZero(dil) / float(width * height)
+    diff = 0.0
+    if prev_mask is not None and prev_mask.shape == ink.shape:
+        diff = cv2.countNonZero(cv2.absdiff(ink, prev_mask)) / float(width * height)
+    return {
+        "ok": density > cfg["text_start_density"], "nglyph": -1, "glyph_h": 0.0,
+        "ink_density": density, "diff_score": diff, "mask": ink, "text_bbox": None,
+    }
+
+
+def find_anchor(frame, rect_px, content, cfg):
+    """在框的左边和上下找棕色底的黑色圆钮(▶),返回 (x, y, w, h) 或 None。"""
+    cx0, cy0, cw, chh = content
+    x, y, w, h = rect_px
+    sx0 = int(max(cx0, x - cfg["anchor_search_left"] * w))
+    sx1 = int(min(cx0 + cw, x + w * 0.6))
+    sy0 = int(max(cy0, y - cfg["anchor_search_updown"] * h))
+    sy1 = int(min(cy0 + chh, y + h + cfg["anchor_search_updown"] * h))
+    if sx1 - sx0 < 24 or sy1 - sy0 < 24:
+        return None
+
+    sub = frame[sy0:sy1, sx0:sx1]
+    gray = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
+    ksize = max(5, int(round(sub.shape[0] * 0.55)) | 1)
+    bg = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+    dark = ((bg.astype(np.int16) - gray.astype(np.int16)) > 30).astype(np.uint8) * 255
+    try:
+        count, _labels, stats, _cents = cv2.connectedComponentsWithStats(dark, 8)
+    except Exception:
+        return None
+
+    best = None
+    for i in range(1, count):
+        bx, by, bw, bh, area = (int(stats[i][j]) for j in range(5))
+        if bh < cfg["anchor_h_min_ratio"] * chh or bh > cfg["anchor_h_max_ratio"] * chh:
+            continue
+        aspect = bw / float(bh)
+        if aspect < cfg["anchor_aspect_min"] or aspect > cfg["anchor_aspect_max"]:
+            continue
+        if area / float(bw * bh) < cfg["anchor_fill_min"]:
+            continue
+        gx, gy = sx0 + bx, sy0 + by
+        if gx + bw < x - w * 0.4:
+            continue
+        if gy + bh < y - h * 0.8 or gy > y + h + h * 0.8:
+            continue
+        if best is None or area > best[0]:
+            best = (area, (gx, gy, bw, bh))
+    return None if best is None else best[1]
+
+
+def detect_content_area(frames, width, height):
+    """去掉录屏常见的上下/左右黑边,返回 (x0, y0, w, h)。"""
+    if not frames:
+        return (0, 0, width, height)
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
+    stack = np.min(np.stack(grays, axis=0), axis=0)
+    dark_row = (stack < 40).mean(axis=1) > 0.9
+    dark_col = (stack < 40).mean(axis=0) > 0.9
+    y0, y1 = 0, height - 1
+    while y0 < height and dark_row[y0]:
+        y0 += 1
+    while y1 > y0 and dark_row[y1]:
+        y1 -= 1
+    x0, x1 = 0, width - 1
+    while x0 < width and dark_col[x0]:
+        x0 += 1
+    while x1 > x0 and dark_col[x1]:
+        x1 -= 1
+    cw, chh = x1 - x0 + 1, y1 - y0 + 1
+    if cw < width * 0.5 or chh < height * 0.4 or cw < 16 or chh < 16:
+        return (0, 0, width, height)
+    return (x0, y0, cw, chh)
+
+
+# ---- 以下为主程序部分(App / 主流程 / 复核) ----
+
+_tls = threading.local()
+
+
+def _thread_loop():
+    """OCR 复用同一个事件循环(别每句都 asyncio.run 新建一次)。"""
+    loop = getattr(_tls, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _tls.loop = loop
+    return loop
+
+
+class VideoProcessor:
+    def __init__(self, logger):
+        self.ocr_engine = None
+        self.logger = logger
+        if HAS_WIN_OCR:
+            try:
+                lang = Language("ja-JP")
+                if OcrEngine.is_language_supported(lang):
+                    self.ocr_engine = OcrEngine.try_create_from_language(lang)
+                    self.logger("✅ [系统] Windows OCR (日语) 就绪。")
+                else:
+                    self.logger("⚠️ [系统] OCR 初始化失败：未安装日语语言包。")
+            except Exception as exc:
+                self.logger("❌ [系统] OCR 初始化异常: %s" % exc)
+
+    async def _run_win_ocr(self, cv2_img):
+        if not self.ocr_engine:
+            return ""
+        try:
+            bgra = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2BGRA)
+            height, width = bgra.shape[:2]
+            writer = streams.DataWriter()
+            writer.write_bytes(bgra.tobytes())
+            ibuffer = writer.detach_buffer()
+            bitmap = SoftwareBitmap.create_copy_from_buffer(
+                ibuffer, BitmapPixelFormat.BGRA8, width, height
+            )
+            result = await self.ocr_engine.recognize_async(bitmap)
+            return result.text.replace(" ", "")
+        except Exception:
+            return ""
+
+    def ocr_image(self, img):
+        if not HAS_WIN_OCR or img is None or img.size == 0:
+            return ""
+        try:
+            return _thread_loop().run_until_complete(self._run_win_ocr(img))
+        except Exception:
+            return ""
+
+
+class Rec:
+    """一条字幕 + 复核要用的信息。"""
+
+    __slots__ = ("st", "et", "content", "kind", "crop", "nglyph", "ocr_ok",
+                 "anchor", "i0", "i1", "reason")
+
+    def __init__(self, st, et, content, kind):
+        self.st = st
+        self.et = et
+        self.content = content
+        self.kind = kind
+        self.crop = None
+        self.nglyph = 0
+        self.ocr_ok = False
+        self.anchor = False
+        self.i0 = 0
+        self.i1 = 0
+        self.reason = []
+
+
+class App:
+    def __init__(self, root, cfg):
+        self.cfg = cfg
+        self.root = root
+        self.root.title("%s %s (%s)  结构判定版" % (APP_NAME, APP_VERSION, BUILD_DATE))
+        self.root.geometry("1280x900")
+
+        self.rect_pct = {
+            "d": list(cfg["rect_d_pct"]),
+            "c": list(cfg["rect_c_pct"]),
+        }
+        self.content = (0, 0, 0, 0)
+        self.video_path = ""
+        self.cap = None
+        self.total_frames = 0
+        self.fps = 30.0
+        self.is_processing = False
+        self.preview_index = 0
+        self.preview_cache = (None, None)
+        self.log_q = queue.Queue()
+
+        self._setup_ui()
+        self.processor = VideoProcessor(self.log)
+        self.log("ℹ️ 版本 %s / 构建 %s" % (APP_VERSION, BUILD_DATE))
+        self.log("ℹ️ 参数文件: %s" % os.path.join(app_dir(), "video_ocr_config.json"))
+        self.root.after(120, self._drain_log)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ---------------- 日志 / 收尾 ----------------
+    def log(self, message):
+        self.log_q.put(str(message))
+
+    def _drain_log(self):
+        try:
+            for _ in range(300):
+                msg = self.log_q.get_nowait()
+                self.txt_log.config(state=tk.NORMAL)
+                self.txt_log.insert(tk.END, msg + "\n")
+                self.txt_log.see(tk.END)
+                self.txt_log.config(state=tk.DISABLED)
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        self.root.after(120, self._drain_log)
+
+    def on_close(self):
+        self.is_processing = False
+        try:
+            if self.cap:
+                self.cap.release()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    # ---------------- 界面 ----------------
+    def _setup_ui(self):
+        f_top1 = tk.Frame(self.root, pady=5)
+        f_top1.pack(fill=tk.X, padx=10)
+        tk.Button(f_top1, text="📂 加载视频", command=self.load_video,
+                  font=("微软雅黑", 10)).pack(side=tk.LEFT)
+        self.lbl_info = tk.Label(f_top1, text="未加载...", fg="blue")
+        self.lbl_info.pack(side=tk.LEFT, padx=10)
+        self.lbl_content = tk.Label(f_top1, text="内容区: -", fg="#666")
+        self.lbl_content.pack(side=tk.LEFT)
+
+        f_top2 = tk.Frame(self.root, pady=5)
+        f_top2.pack(fill=tk.X, padx=10)
+        self.var_mode = tk.StringVar(value="BLACK")
+        tk.Label(f_top2, text="模式:", font=("微软雅黑", 10, "bold")).pack(side=tk.LEFT)
+        tk.Radiobutton(f_top2, text="TWST (黑字)", variable=self.var_mode,
+                       value="BLACK").pack(side=tk.LEFT)
+        tk.Radiobutton(f_top2, text="18TRIP (白字)", variable=self.var_mode,
+                       value="WHITE").pack(side=tk.LEFT, padx=10)
+
+        self.var_detect = tk.StringVar(value=self.cfg["detect_mode"])
+        tk.Label(f_top2, text="判定:").pack(side=tk.LEFT, padx=(14, 2))
+        ttk.Combobox(f_top2, textvariable=self.var_detect, width=9, state="readonly",
+                     values=("structure", "legacy")).pack(side=tk.LEFT)
+
+        self.var_review = tk.StringVar(value=self.cfg["review_mode"])
+        tk.Label(f_top2, text="复核:").pack(side=tk.LEFT, padx=(14, 2))
+        ttk.Combobox(f_top2, textvariable=self.var_review, width=12, state="readonly",
+                     values=("off", "report", "report+delete")).pack(side=tk.LEFT)
+
+        self.var_ocr = tk.BooleanVar(value=False)
+        cb_ocr = tk.Checkbutton(f_top2, text="启用 OCR", variable=self.var_ocr,
+                                font=("微软雅黑", 10, "bold"), fg="purple")
+        cb_ocr.pack(side=tk.LEFT, padx=14)
+        if not HAS_WIN_OCR:
+            cb_ocr.config(state=tk.DISABLED, text="OCR不可用")
+
+        self.var_verbose = tk.BooleanVar(value=True)
+        tk.Checkbutton(f_top2, text="诊断日志", variable=self.var_verbose).pack(side=tk.LEFT)
+
+        self.btn_run = tk.Button(f_top2, text="▶️ 开始处理", command=self.start_task,
+                                 bg="#ddffdd", font=("微软雅黑", 11, "bold"))
+        self.btn_run.pack(side=tk.RIGHT)
+        self.btn_stop = tk.Button(f_top2, text="🛑 停止", command=self.stop_task,
+                                  bg="#ffdddd", font=("微软雅黑", 11), state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.RIGHT, padx=10)
+
+        f_mid = tk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        f_mid.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        canvas_frame = tk.Frame(f_mid, bg="#222")
+        f_mid.add(canvas_frame, stretch="always")
+        self.canvas = tk.Canvas(canvas_frame, bg="black")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        f_log = tk.Frame(f_mid)
+        f_mid.add(f_log, width=380)
+        tk.Label(f_log, text="📜 运行日志").pack(anchor="w")
+        self.txt_log = tk.Text(f_log, bg="#1e1e1e", fg="#00ff00",
+                               font=("Consolas", 9), state=tk.DISABLED)
+        self.txt_log.pack(fill=tk.BOTH, expand=True)
+
+        f_ctrl = tk.Frame(self.root, height=180)
+        f_ctrl.pack(fill=tk.X, padx=10, pady=5)
+        self.nb = ttk.Notebook(f_ctrl)
+        self.nb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.rect_ui = {}
+        self.create_tab("对话框(绿)", "d")
+        self.create_tab("选项框(蓝)", "c")
+        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self.update_preview(force=True))
+
+        f_sets = tk.LabelFrame(f_ctrl, text="设置", padx=5)
+        f_sets.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+        tk.Label(f_sets, text="防连读灵敏度(越小越容易切断):").pack(anchor="w")
+        self.s_diff = tk.Scale(f_sets, from_=0.3, to=10.0, resolution=0.1,
+                               orient=tk.HORIZONTAL)
+        self.s_diff.set(float(self.cfg["sensitivity"]))
+        self.s_diff.pack(fill=tk.X)
+
+        tk.Label(f_sets, text="文字/边缘 阈值(TWST 也生效):").pack(anchor="w")
+        self.s_bin = tk.Scale(f_sets, from_=float(self.cfg["bin_threshold_min"]),
+                              to=float(self.cfg["bin_threshold_max"]),
+                              orient=tk.HORIZONTAL, command=self.on_bin_change)
+        self.s_bin.set(float(self.cfg["bin_threshold_twst"]))
+        self.s_bin.pack(fill=tk.X)
+
+        f_bot = tk.Frame(self.root)
+        f_bot.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=8)
+        line1 = tk.Frame(f_bot)
+        line1.pack(fill=tk.X)
+        self.lbl_time = tk.Label(line1, text="00:00.0 / 00:00.0", width=22, anchor="w")
+        self.lbl_time.pack(side=tk.LEFT)
+        self.ent_jump = tk.Entry(line1, width=12)
+        self.ent_jump.pack(side=tk.LEFT, padx=(6, 2))
+        self.ent_jump.bind("<Return>", lambda _e: self.jump_to_entry())
+        tk.Button(line1, text="跳转", command=self.jump_to_entry).pack(side=tk.LEFT)
+        tk.Label(line1, text="(可填 90 / 1:30 / 01:02:03)").pack(side=tk.LEFT, padx=6)
+
+        self.s_time = tk.Scale(f_bot, from_=0.0, to=100.0, resolution=0.1,
+                               orient=tk.HORIZONTAL, showvalue=0, command=self.on_seek)
+        self.s_time.pack(fill=tk.X)
+        self.progress = ttk.Progressbar(f_bot, mode="determinate")
+        self.progress.pack(fill=tk.X, pady=5)
+        self.progress.bind("<Button-1>", self.on_progress_click)
+
+    def create_tab(self, title, key):
+        frame = tk.Frame(self.nb)
+        self.nb.add(frame, text=title)
+        self.rect_ui[key] = []
+        for idx, label in enumerate("XYWH"):
+            row = tk.Frame(frame)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            tk.Label(row, text=label + " %", width=4).pack(side=tk.LEFT)
+            scale = tk.Scale(row, from_=0.0, to=100.0, resolution=0.5,
+                             orient=tk.HORIZONTAL,
+                             command=lambda v, k=key, i=idx: self.on_rect(v, i, k))
+            scale.set(self.rect_pct[key][idx])
+            scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            entry = tk.Entry(row, width=6)
+            entry.insert(0, "%.1f" % self.rect_pct[key][idx])
+            entry.bind("<Return>", lambda _e, k=key, i=idx: self.on_rect_entry(k, i))
+            entry.pack(side=tk.LEFT)
+            self.rect_ui[key].append((scale, entry))
+
+    # ---------------- 区域 / 预览 ----------------
+    def on_rect(self, value, idx, key):
+        try:
+            self.rect_pct[key][idx] = float(value)
+        except Exception:
+            return
+        _scale, entry = self.rect_ui[key][idx]
+        entry.delete(0, tk.END)
+        entry.insert(0, "%.1f" % self.rect_pct[key][idx])
+        self.update_preview()
+
+    def on_rect_entry(self, key, idx):
+        scale, entry = self.rect_ui[key][idx]
+        try:
+            value = float(entry.get())
+        except Exception:
+            entry.delete(0, tk.END)
+            entry.insert(0, "%.1f" % self.rect_pct[key][idx])
+            return
+        value = max(0.0, min(100.0, value))
+        self.rect_pct[key][idx] = value
+        scale.set(value)
+        self.update_preview()
+
+    def on_bin_change(self, _value=None):
+        self.update_preview()
+
+    def rect_px(self, key):
+        cx, cy, cw, chh = self.content or (0, 0, 0, 0)
+        if cw <= 0 or chh <= 0:
+            return [0, 0, 0, 0]
+        px, py, pw, ph = self.rect_pct[key]
+        return [
+            int(cx + cw * px / 100.0),
+            int(cy + chh * py / 100.0),
+            max(1, int(cw * pw / 100.0)),
+            max(1, int(chh * ph / 100.0)),
+        ]
+
+    def active_tab(self):
+        try:
+            return "d" if self.nb.index(self.nb.select()) == 0 else "c"
+        except Exception:
+            return "d"
+
+    def load_video(self):
+        path = filedialog.askopenfilename()
+        if not path:
+            return
+        self.video_path = path
+        if self.cap:
+            self.cap.release()
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            self.log("❌ 打不开这个视频: %s" % path)
+            self.video_path = ""
+            return
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.fps = float(fps) if fps and fps > 0 else 30.0
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        samples = []
+        try:
+            for frac in (0.02, 0.5, 0.95):
+                idx = int(max(0, min(max(0, self.total_frames - 1),
+                                      self.total_frames * frac)))
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, frame = self.cap.read()
+                if ok:
+                    samples.append(frame)
+        except Exception:
+            samples = []
+        try:
+            self.content = detect_content_area(samples, width, height)
+        except Exception:
+            self.content = (0, 0, width, height)
+        cx, cy, cw, chh = self.content
+
+        duration = (self.total_frames / self.fps) if self.fps > 0 else 0.0
+        self.s_time.config(to=max(1.0, duration))
+        self.lbl_info.config(text="%s (%dx%d, %.2ffps, %s)" % (
+            os.path.basename(path), width, height, self.fps, fmt_timecode(duration)))
+        self.lbl_content.config(text="内容区: %d,%d %dx%d" % (cx, cy, cw, chh))
+        self.log("📂 已加载: %s" % path)
+        self.log("ℹ️ 内容区(去黑边后) = (%d, %d) %d x %d" % (cx, cy, cw, chh))
+        self.preview_cache = (None, None)
+        self.preview_index = 0
+        self.s_time.set(0.0)
+        self.update_preview(force=True)
+
+    def on_seek(self, _value=None):
+        self.update_preview()
+
+    def jump_to_entry(self):
+        if not self.cap:
+            return
+        duration = max(1.0, self.total_frames / self.fps)
+        seconds = parse_timecode(self.ent_jump.get(), duration)
+        if seconds is None:
+            self.log("⚠️ 跳转失败: 看不懂的时间 %s" % self.ent_jump.get())
+            return
+        self.s_time.set(seconds)
+        self.update_preview(force=True)
+
+    def on_progress_click(self, event):
+        if not self.cap or self.total_frames <= 0:
+            return
+        width = max(1, self.progress.winfo_width())
+        frac = max(0.0, min(1.0, event.x / float(width)))
+        self.s_time.set(frac * (self.total_frames / self.fps))
+        self.update_preview(force=True)
+
+    def _grab(self, index):
+        """缓存当前帧:拖动滑杆时不再重新 seek(H.264 重新解码就是卡顿的根源)。"""
+        cached_idx, cached_img = self.preview_cache
+        if cached_img is not None and cached_idx == index:
+            return cached_img
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ok, frame = self.cap.read()
+        if not ok:
+            return None
+        self.preview_cache = (index, frame)
+        return frame
+
+    def update_preview(self, _value=None, force=False):
+        if not self.cap or self.is_processing:
+            return
+        index = int(self.s_time.get() * self.fps)
+        top = max(0, self.total_frames - 1)
+        index = max(0, min(top, index))
+        self.preview_index = index
+        frame = self._grab(index)
+        if frame is None:
+            return
+        frame = frame.copy()
+        self._draw_overlay(frame, self.active_tab())
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+        cw = self.canvas.winfo_width()
+        chh = self.canvas.winfo_height()
+        if cw > 1 and chh > 1:
+            img.thumbnail((cw, chh))
+        self.photo = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        self.canvas.create_image(cw // 2, chh // 2, image=self.photo, anchor=tk.CENTER)
+        self.lbl_time.config(text="%s / %s" % (
+            fmt_timecode(index / self.fps),
+            fmt_timecode(self.total_frames / self.fps)))
+
+    def _draw_overlay(self, frame, tab):
+        dark_on_light = (self.var_mode.get() == "BLACK")
+        thr = float(self.s_bin.get())
+        cx, cy, cw, chh = self.content
+        if cw > 0 and chh > 0:
+            cv2.rectangle(frame, (cx, cy), (cx + cw - 1, cy + chh - 1), (90, 90, 90), 1)
+
+        x, y, w, h = self.rect_px(tab)
+        if w > 4 and h > 4 and y + h <= frame.shape[0] and x + w <= frame.shape[1]:
+            roi = frame[y:y + h, x:x + w]
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            ink = _ink_mask(gray, dark_on_light, thr, self.cfg["local_contrast"])
+            ink_bgr = cv2.cvtColor(ink, cv2.COLOR_GRAY2BGR)
+            frame[y:y + h, x:x + w] = cv2.addWeighted(roi, 0.35, ink_bgr, 0.65, 0)
+
+        x, y, w, h = self.rect_px("d")
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        x, y, w, h = self.rect_px("c")
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
+        anchor = find_anchor(frame, self.rect_px("c"), self.content, self.cfg)
+        if anchor:
+            ax, ay, aw, ah = anchor
+            cv2.rectangle(frame, (ax, ay), (ax + aw, ay + ah), (0, 165, 255), 2)
+
+    # ---------------- 任务控制 ----------------
+    def stop_task(self):
+        self.is_processing = False
+        self.log("⚠️ 收到停止指令，正在安全退出...")
+
+    def start_task(self):
+        if not self.video_path:
+            return
+        self.is_processing = True
+        self.btn_run.config(state=tk.DISABLED, text="处理中...")
+        self.btn_stop.config(state=tk.NORMAL)
+        self.log("")
+        self.log("🚀 === %s 开始提取 ===" % APP_VERSION)
+        threading.Thread(target=self.run_process, daemon=True).start()
+
+    # ---------------- 以下为主流程与复核 ----------------
+
+    def run_process(self):
+        cfg = dict(self.cfg)
+        try:
+            rect_d = self.rect_px("d")
+            rect_c = self.rect_px("c")
+            content = self.content
+            content_h = content[3]
+            dark_on_light = (self.var_mode.get() == "BLACK")
+            thr = float(self.s_bin.get())
+            p_diff = float(self.s_diff.get()) / 100.0
+            do_ocr = bool(self.var_ocr.get())
+            use_structure = (self.var_detect.get() == "structure")
+            review_mode = self.var_review.get()
+            verbose = bool(self.var_verbose.get())
+            require_anchor = dark_on_light or bool(cfg["require_anchor_in_white_mode"])
+
+            cap = cv2.VideoCapture(self.video_path)
+            if not cap.isOpened():
+                self.log("❌ 打不开视频(确认文件没被别的程序占用): %s" % self.video_path)
+                return
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = self.fps if self.fps > 0 else 30.0
+            recs = []
+            self.log("ℹ️ 对话框(像素) %s / 选项框(像素) %s" % (rect_d, rect_c))
+            self.log("ℹ️ 判定=%s 阈值=%d 防连读=%.1f OCR=%s" % (
+                self.var_detect.get(), int(thr), self.s_diff.get(), "开" if do_ocr else "关"))
+
+            def ocr_of(crop, fallback):
+                if not do_ocr or crop is None or crop.size == 0:
+                    return False, fallback
+                try:
+                    text = self.processor.ocr_image(crop)
+                except Exception:
+                    text = ""
+                if text and len(text.strip()) >= 2:
+                    return True, text.strip()
+                return False, fallback
+
+            def pick_crop(roi, info):
+                """送给 OCR 的图:默认只给"文字行"那一块,圆钮/名牌自然被排除。"""
+                if roi is None:
+                    return None
+                if not cfg["ocr_crop_to_text"] or not info or not info.get("text_bbox"):
+                    return roi.copy()
+                bx, by, bw, bh = info["text_bbox"]
+                pad = 3
+                x0 = max(0, bx - pad)
+                y0 = max(0, by - pad)
+                x1 = min(roi.shape[1], bx + bw + pad)
+                y1 = min(roi.shape[0], by + bh + pad)
+                if x1 <= x0 or y1 <= y0:
+                    return roi.copy()
+                return roi[y0:y1, x0:x1].copy()
+
+            # 对话轨状态
+            d_active = False
+            d_start = 0
+            d_peak = 0.0
+            d_miss = 0
+            d_glyph_max = 0
+            d_best_density = 0.0
+            d_best_crop = None
+            d_mask_prev = None
+
+            # 选项轨状态
+            c_active = False
+            c_start = 0
+            c_empty = 0
+            c_locked = False
+            c_still = 0
+            c_glyph_max = 0
+            c_best_density = 0.0
+            c_best_crop = None
+            c_fallback_crop = None
+            c_mask_prev = None
+            c_anchor_seen = False
+
+            idx = 0
+            while self.is_processing:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if total > 0 and idx % 60 == 0:
+                    prog = (idx / float(total)) * 100.0
+                    self.root.after(0, lambda v=prog: self.progress.config(value=v))
+
+                # ---------- 对话轨 ----------
+                x, y, w, h = rect_d
+                d_info = None
+                roi_d = None
+                if (w > 1 and h > 1 and y + h <= frame.shape[0]
+                        and x + w <= frame.shape[1]):
+                    roi_d = frame[y:y + h, x:x + w]
+                    if use_structure:
+                        d_info = analyze_text_auto(roi_d, dark_on_light, thr,
+                                                   content_h, cfg, d_mask_prev)
+                    else:
+                        d_info = legacy_density(roi_d, dark_on_light, cfg, d_mask_prev)
+                    if d_info is not None:
+                        d_mask_prev = d_info["mask"].copy()
+
+                if d_info is not None:
+                    has_text = bool(d_info["ok"])
+                    density = d_info["ink_density"]
+                    diff_score = d_info["diff_score"]
+                    if not d_active:
+                        if has_text and density >= cfg["text_start_density"]:
+                            d_active = True
+                            d_start = idx
+                            d_peak = density
+                            d_miss = 0
+                            d_glyph_max = d_info["nglyph"]
+                            d_best_density = density
+                            d_best_crop = pick_crop(roi_d, d_info)
+                    else:
+                        if has_text:
+                            d_miss = 0
+                            d_peak = max(d_peak, density)
+                            if density > d_best_density + 0.001:
+                                d_best_density = density
+                                d_best_crop = pick_crop(roi_d, d_info)
+                            d_glyph_max = max(d_glyph_max, d_info["nglyph"])
+                        else:
+                            d_miss += 1
+
+                        should_cut = False
+                        if d_miss >= int(cfg["miss_frames_to_cut"]):
+                            should_cut = True
+                        elif density < max(cfg["cut_abs_floor"],
+                                           d_peak * cfg["cut_peak_ratio"]):
+                            should_cut = True
+                        elif (has_text and diff_score > p_diff
+                              and (idx - d_start) / fps > cfg["motion_cut_after"]):
+                            should_cut = True
+
+                        if should_cut:
+                            dur = (idx - d_start) / fps
+                            if dur > cfg["min_dur_dialog"]:
+                                st = datetime.timedelta(seconds=d_start / fps)
+                                et = datetime.timedelta(seconds=idx / fps)
+                                ocr_ok, content_d = ocr_of(d_best_crop, "Line [Dialog]")
+                                rec = Rec(st, et, content_d, "dialog")
+                                rec.crop = d_best_crop
+                                rec.nglyph = d_glyph_max
+                                rec.ocr_ok = ocr_ok
+                                rec.i0, rec.i1 = d_start, idx
+                                prev = recs[-1] if recs else None
+                                if (prev is not None and ocr_ok and prev.ocr_ok
+                                        and prev.kind == "dialog"
+                                        and prev.content == content_d
+                                        and 0 <= (d_start - prev.i1) <= int(fps * 3)):
+                                    prev.et = et
+                                    prev.i1 = idx
+                                    self.log("🔄 缝合对话碎片: %s..." % content_d[:10])
+                                else:
+                                    recs.append(rec)
+                                    self.log("✅ 对话: %s..." % content_d[:15])
+                                if verbose:
+                                    self.log("   └ idx=%d 时长=%.2fs 墨水=%.3f 峰值=%.3f 字形=%d"
+                                             % (idx, dur, density, d_peak, d_glyph_max))
+                            if has_text and density >= cfg["text_start_density"]:
+                                d_active = True
+                                d_start = idx
+                                d_peak = density
+                                d_miss = 0
+                                d_glyph_max = d_info["nglyph"]
+                                d_best_density = density
+                                d_best_crop = pick_crop(roi_d, d_info)
+                            else:
+                                d_active = False
+                                d_peak = 0.0
+                                d_glyph_max = 0
+                                d_best_density = 0.0
+                                d_best_crop = None
+
+                # ---------- 选项轨 ----------
+                xc, yc, wc, hc = rect_c
+                c_info = None
+                roi_c = None
+                anchor = None
+                if (wc > 1 and hc > 1 and yc + hc <= frame.shape[0]
+                        and xc + wc <= frame.shape[1]):
+                    roi_c = frame[yc:yc + hc, xc:xc + wc]
+                    if require_anchor:
+                        anchor = find_anchor(frame, rect_c, content, cfg)
+                    if use_structure:
+                        c_info = analyze_text_auto(roi_c, dark_on_light, thr,
+                                                   content_h, cfg, c_mask_prev)
+                    else:
+                        c_info = legacy_density(roi_c, dark_on_light, cfg, c_mask_prev)
+                    if c_info is not None:
+                        c_mask_prev = c_info["mask"].copy()
+                    if anchor is not None:
+                        c_anchor_seen = True
+
+                if c_info is not None:
+                    density_c = c_info["ink_density"]
+                    diff_c = c_info["diff_score"]
+                    anchor_ok = (not require_anchor) or (anchor is not None)
+                    is_choice = (bool(c_info["ok"]) and anchor_ok
+                                 and density_c >= cfg["choice_start_density"])
+
+                    if not c_active:
+                        if is_choice:
+                            c_active = True
+                            c_start = idx
+                            c_empty = 0
+                            c_locked = False
+                            c_still = 0
+                            c_glyph_max = c_info["nglyph"]
+                            c_best_density = density_c
+                            c_best_crop = None
+                            c_fallback_crop = pick_crop(roi_c, c_info)
+                    else:
+                        if is_choice:
+                            c_empty = 0
+                            if density_c > c_best_density:
+                                c_best_density = density_c
+                                c_glyph_max = max(c_glyph_max, c_info["nglyph"])
+                                if not c_locked:
+                                    c_fallback_crop = pick_crop(roi_c, c_info)
+                            if not c_locked:
+                                if diff_c < cfg["still_diff"]:
+                                    c_still += 1
+                                    if c_still >= int(cfg["choice_still_frames"]):
+                                        c_best_crop = pick_crop(roi_c, c_info)
+                                        c_locked = True
+                                        self.log("📸[选项快门] 发现完美静止画面，锁定！")
+                                else:
+                                    c_still = 0
+                        else:
+                            c_empty += 1
+                            if c_empty > int(cfg["choice_absent_frames"]):
+                                c_active = False
+                                real_end = max(c_start,
+                                               idx - int(cfg["choice_absent_frames"]))
+                                dur_c = (real_end - c_start) / fps
+                                if dur_c > cfg["min_dur_choice"]:
+                                    st_c = datetime.timedelta(seconds=c_start / fps)
+                                    et_c = datetime.timedelta(seconds=real_end / fps)
+                                    target = c_best_crop if c_locked else c_fallback_crop
+                                    ocr_ok_c, content_c = ocr_of(target, "Line [Choice]")
+                                    if ocr_ok_c:
+                                        content_c = "%s [Choice]" % content_c
+                                    rec = Rec(st_c, et_c, content_c, "choice")
+                                    rec.crop = target
+                                    rec.nglyph = c_glyph_max
+                                    rec.ocr_ok = ocr_ok_c
+                                    rec.anchor = c_anchor_seen
+                                    rec.i0, rec.i1 = c_start, real_end
+                                    prev = recs[-1] if recs else None
+                                    if (prev is not None and ocr_ok_c and prev.ocr_ok
+                                            and prev.content == content_c
+                                            and 0 <= (c_start - prev.i1) <= int(fps * 3)):
+                                        prev.et = et_c
+                                        prev.i1 = real_end
+                                        self.log("🔄 缝合选项碎片: %s..." % content_c[:10])
+                                    else:
+                                        recs.append(rec)
+                                        self.log("🔹 选项结算: %s..." % content_c[:15])
+                                    if verbose:
+                                        self.log("   └ idx=%d 时长=%.2fs 锁=%s 字形=%d 圆钮=%s"
+                                                 % (idx, dur_c,
+                                                    "是" if c_locked else "否",
+                                                    c_glyph_max,
+                                                    "有" if c_anchor_seen else "无"))
+                idx += 1
+
+            cap.release()
+            if total > 0:
+                self.root.after(0, lambda: self.progress.config(value=100.0))
+
+            recs.sort(key=lambda r: r.st)
+            for i, rec in enumerate(recs):
+                if rec.content == "Line [Dialog]":
+                    rec.content = "Line %d" % (i + 1)
+                elif rec.content == "Line [Choice]":
+                    rec.content = "Line %d [Choice]" % (i + 1)
+            subs = [srt.Subtitle(index=i + 1, start=r.st, end=r.et, content=r.content)
+                    for i, r in enumerate(recs)]
+
+            base = os.path.splitext(self.video_path)[0]
+            srt_path = base + ("_OCR.srt" if do_ocr else ".srt")
+            with open(srt_path, "w", encoding="utf-8-sig") as fp:
+                fp.write(srt.compose(subs))
+            self.log("💾 已写入: %s（共 %d 条）" % (srt_path, len(subs)))
+
+            if review_mode == "off":
+                self.log("ℹ️ 复核已关闭")
+            else:
+                self.run_review(recs, base, srt_path, dark_on_light, thr,
+                                content_h, cfg, review_mode)
+
+            if self.is_processing:
+                self.root.after(0, lambda p=srt_path: messagebox.showinfo(
+                    "完成", "任务结束。\n文件已保存至:\n%s" % p))
+        except Exception as exc:
+            self.log("❌ [致命错误] %s" % exc)
+            self.log(traceback.format_exc())
+        finally:
+            self.is_processing = False
+            self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL,
+                                                           text="▶️ 开始处理"))
+            self.root.after(0, lambda: self.btn_stop.config(state=tk.DISABLED))
+
+    def run_review(self, recs, base, srt_path, dark_on_light, thr, content_h,
+                   cfg, review_mode):
+        """对第一遍留下的候选帧再用更严格的判据看一遍。
+
+        严格判据 = 多要一个字 + 打开宽度变异检查(防书架/栅栏那种整齐排列)。
+        默认只报告;选 report+delete 才删除"严格判据认不出文字且 OCR 也没文本"的行。
+        """
+        strict = dict(cfg)
+        strict["min_glyphs"] = int(cfg["min_glyphs"]) + 1
+        strict["glyph_width_cv_min"] = max(0.18, float(cfg.get("glyph_width_cv_min", 0)))
+        strict["try_opposite_polarity"] = False
+
+        review_dir = base + "_review"
+        report_path = base + "_review.txt"
+        rows = []
+        for i, rec in enumerate(recs):
+            reasons = []
+            strong = False
+            if rec.crop is not None and getattr(rec.crop, "size", 0):
+                info = analyze_text(rec.crop, dark_on_light, thr, content_h, strict)
+                strong = bool(info and info["ok"])
+            if not strong:
+                reasons.append("严格判据无文字")
+            if not rec.ocr_ok:
+                reasons.append("OCR无文本")
+            if rec.kind == "choice" and not rec.anchor:
+                reasons.append("未见圆钮")
+            rec.reason = reasons
+            rows.append((i + 1, rec, strong))
+
+        suspicious = [r for r in rows if r[1].reason]
+        try:
+            os.makedirs(review_dir, exist_ok=True)
+        except Exception:
+            pass
+        saved = 0
+        for number, rec, _strong in suspicious:
+            if rec.crop is None or not getattr(rec.crop, "size", 0):
+                continue
+            name = "L%04d_%s.jpg" % (number, str(rec.st).replace(":", "-"))
+            if write_image_unicode(os.path.join(review_dir, name), rec.crop):
+                saved += 1
+
+        try:
+            with open(report_path, "w", encoding="utf-8-sig") as fp:
+                fp.write("复核报告  构建 %s (%s)\n" % (APP_VERSION, BUILD_DATE))
+                fp.write("共 %d 条,可疑 %d 条,存图 %d 张 -> %s\n" % (
+                    len(recs), len(suspicious), saved, review_dir))
+                fp.write("=" * 78 + "\n")
+                fp.write("列: 序号 判定 起 止 原因 内容\n")
+                for number, rec, strong in suspicious:
+                    fp.write("#%-5d %s  %s -> %s  [%s]  %s\n" % (
+                        number, "强" if strong else "弱", str(rec.st), str(rec.et),
+                        ",".join(rec.reason), rec.content[:40]))
+        except Exception as exc:
+            self.log("⚠️ 复核报告写入失败: %s" % exc)
+            return
+
+        self.log("🔍 复核: 可疑 %d/%d 条,报告 %s" % (
+            len(suspicious), len(recs), report_path))
+        for number, rec, _strong in suspicious[:40]:
+            self.log("   · #%d %s [%s] %s" % (
+                number, rec.content[:20], ",".join(rec.reason), str(rec.st)))
+
+        if review_mode != "report+delete":
+            return
+        keep = []
+        deleted = 0
+        for _number, rec, strong in rows:
+            if (not strong) and (not rec.ocr_ok):
+                deleted += 1
+            else:
+                keep.append(rec)
+        if not deleted:
+            self.log("🧹 没有需要删除的行")
+            return
+        try:
+            with open(srt_path, "rb") as src, open(srt_path + ".bak", "wb") as dst:
+                dst.write(src.read())
+            subs = [srt.Subtitle(index=i + 1, start=r.st, end=r.et, content=r.content)
+                    for i, r in enumerate(keep)]
+            with open(srt_path, "w", encoding="utf-8-sig") as fp:
+                fp.write(srt.compose(subs))
+            self.log("🧹 已删除 %d 条空行，原文件备份为 %s.bak" % (deleted, srt_path))
+        except Exception as exc:
+            self.log("⚠️ 自动删除失败(原文件未改动): %s" % exc)
+
+
+def main():
+    cfg = load_config()
+    root = tk.Tk()
+    App(root, cfg)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
