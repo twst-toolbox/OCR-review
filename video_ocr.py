@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V16
+V17
+
+V16 -> V17 的改动(详见 README.md):
+  1. 选项标记回归:读不出文字的选项段也输出 `Line N [Choice]`(方便人工定位),
+     OCR 读到文字就带上文字 —— V16 的"读不出就整段丢弃"太狠,把 1:13 那处也丢了;
+  2. OCR 补救:有些句子"墨水最多那一帧"正好是空气泡(实测确实有),扫描结束后会在
+     它的时间范围内换几帧重试,把"真台词却变成 Line N"的补回来;
+  3. 新增「🔍 复核」小窗口(视频 + SRT):逐条跳到它自己的时间里抽几帧核实,默认只出
+     报告;也可以另存"标记版 SRT"(可疑行前面加 [?],方便在 Aegisub 里过一遍),
+     或者直接删掉空行(自动存 .bak)。带 [Choice] 的行永不删。
 
 V15 -> V16 的改动(详见 README.md)。这一版的原则是"宁可多,不可漏":
   1. 【重要】对话框默认改回 V12 的"只数墨水"判据。结构判据要求"≥3 个字形 + 占框宽
@@ -102,9 +111,12 @@ DEFAULT_CONFIG = {
     "choice_absent_seconds": 0.35,
     "motion_cut_stable_frames": 3,
     "merge_prefix_ratio": 0.7,
-    "drop_unreadable_choice": True,
+    "drop_unreadable_choice": False,
     "choice_min_jp_chars": 2,
     "choice_max_tries": 3,
+    "retry_ocr_frames": 4,
+    "check_frames": 4,
+    "check_mark": "[?]",
     "still_diff": 0.001,
     "choice_start_density": 0.004,
     "min_glyphs": 3,
@@ -281,6 +293,16 @@ def prepare_ocr_image(crop, cfg):
                 max(2.0, min_h / float(height)))
     return cv2.resize(crop, (max(1, int(width * scale)), max(1, int(height * scale))),
                       interpolation=cv2.INTER_CUBIC)
+
+
+def grab_frame(cap, index):
+    """跳到指定帧读一张图。seek 会从关键帧开始解,偶尔偏几帧,复核够用了。"""
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(max(0, index)))
+        ok, frame = cap.read()
+        return frame if ok else None
+    except Exception:
+        return None
 
 
 def _ink_mask(gray, dark_on_light, thr, local_contrast):
@@ -744,6 +766,8 @@ class App:
         f_top1.pack(fill=tk.X, padx=10)
         tk.Button(f_top1, text="📂 加载视频", command=self.load_video,
                   font=("微软雅黑", 10)).pack(side=tk.LEFT)
+        tk.Button(f_top1, text="🔍 复核(视频+SRT)", command=self.open_check_window,
+                  font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=8)
         self.lbl_info = tk.Label(f_top1, text="未加载...", fg="blue")
         self.lbl_info.pack(side=tk.LEFT, padx=10)
         self.lbl_content = tk.Label(f_top1, text="内容区: -", fg="#666")
@@ -895,8 +919,9 @@ class App:
     def on_bin_change(self, _value=None):
         self.update_preview()
 
-    def rect_px(self, key):
-        cx, cy, cw, chh = self.content or (0, 0, 0, 0)
+    def rect_px_in(self, content, key):
+        """按给定的内容区把百分比换成像素(复核别的视频时要用)。"""
+        cx, cy, cw, chh = content or (0, 0, 0, 0)
         if cw <= 0 or chh <= 0:
             return [0, 0, 0, 0]
         px, py, pw, ph = self.rect_pct[key]
@@ -906,6 +931,9 @@ class App:
             max(1, int(cw * pw / 100.0)),
             max(1, int(chh * ph / 100.0)),
         ]
+
+    def rect_px(self, key):
+        return self.rect_px_in(self.content, key)
 
     def active_tab(self):
         try:
@@ -1063,6 +1091,247 @@ class App:
             cv2.rectangle(frame, (ax, ay), (ax + aw, ay + ah), (0, 165, 255), 2)
 
     # ---------------- 任务控制 ----------------
+    # ---------------- 复核:视频 + SRT → 只报告 / 标记 / 删空行 ----------------
+    def open_check_window(self):
+        win = tk.Toplevel(self.root)
+        win.title("复核:视频 + SRT")
+        win.geometry("790x340")
+        self.chk_win = win
+        row = tk.Frame(win)
+        row.pack(fill=tk.X, padx=10, pady=6)
+        tk.Label(row, text="视频:", width=6).pack(side=tk.LEFT)
+        self.chk_video = tk.StringVar(value=self.video_path or "")
+        tk.Entry(row, textvariable=self.chk_video).pack(side=tk.LEFT, fill=tk.X,
+                                                        expand=True)
+        tk.Button(row, text="选…", command=lambda: self._pick_file(self.chk_video, False)
+                  ).pack(side=tk.LEFT, padx=4)
+        row2 = tk.Frame(win)
+        row2.pack(fill=tk.X, padx=10, pady=4)
+        tk.Label(row2, text="字幕:", width=6).pack(side=tk.LEFT)
+        self.chk_srt = tk.StringVar(value="")
+        tk.Entry(row2, textvariable=self.chk_srt).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(row2, text="选…", command=lambda: self._pick_file(self.chk_srt, True)
+                  ).pack(side=tk.LEFT, padx=4)
+        row3 = tk.Frame(win)
+        row3.pack(fill=tk.X, padx=10, pady=4)
+        tk.Label(row3, text="方式:", width=6).pack(side=tk.LEFT)
+        self.chk_mode = tk.StringVar(value="只报告")
+        ttk.Combobox(row3, textvariable=self.chk_mode, width=18, state="readonly",
+                     values=("只报告", "只报告+标记版SRT", "报告+删掉空行")
+                     ).pack(side=tk.LEFT)
+        tk.Label(row3, text="　删之前自动存 .bak;带 [Choice] 的行永不删", fg="#666"
+                 ).pack(side=tk.LEFT)
+        row4 = tk.Frame(win)
+        row4.pack(fill=tk.X, padx=10, pady=8)
+        tk.Button(row4, text="▶️ 开始复核", command=self.start_check, bg="#ddffdd",
+                  font=("微软雅黑", 11, "bold")).pack(side=tk.LEFT)
+        self.chk_bar = ttk.Progressbar(row4, mode="determinate")
+        self.chk_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        tk.Label(win, justify=tk.LEFT, fg="#555",
+                 text=("逐条跳到它自己的时间里抽几帧,看框里到底有没有文字。\n"
+                       "判据 = 文字行结构 + 文字坐在气泡底色上 + OCR 读不读得出,三者都否才判可疑。\n"
+                       "所以\"画面上有字、只是 OCR 没读出来\"的短句不会被误判。\n"
+                       "报告写在字幕旁边:<名字>_check.txt;可疑行的截图在同名 _check 文件夹里。")
+                 ).pack(anchor="w", padx=12, pady=4)
+
+    def _pick_file(self, var, is_srt):
+        if is_srt:
+            p = filedialog.askopenfilename(filetypes=[("字幕", "*.srt"), ("所有", "*.*")])
+        else:
+            p = filedialog.askopenfilename()
+        if p:
+            var.set(p)
+
+    def _set_check_progress(self, value):
+        try:
+            self.chk_bar.config(value=value)
+        except Exception:
+            pass
+
+    def start_check(self):
+        if self.is_processing:
+            self.log("⚠️ 还有任务在跑,先等它结束或按停止")
+            return
+        video = (self.chk_video.get() or "").strip()
+        srt_path = (self.chk_srt.get() or "").strip()
+        if not video or not os.path.exists(video):
+            self.log("⚠️ 复核:先选视频")
+            return
+        if not srt_path:
+            guess = os.path.splitext(video)[0] + "_OCR.srt"
+            if os.path.exists(guess):
+                srt_path = guess
+                self.chk_srt.set(guess)
+        if not srt_path or not os.path.exists(srt_path):
+            self.log("⚠️ 复核:先选字幕(默认会自动找同目录的 <视频名>_OCR.srt)")
+            return
+        mode = self.chk_mode.get()
+        self.is_processing = True
+        self.btn_run.config(state=tk.DISABLED, text="处理中...")
+        self.btn_stop.config(state=tk.NORMAL)
+        self.log("")
+        self.log("🔍 === 复核开始(%s)===" % mode)
+        threading.Thread(target=self.run_check, args=(video, srt_path, mode),
+                         daemon=True).start()
+
+    def run_check(self, video, srt_path, mode):
+        try:
+            cfg = dict(self.cfg)
+            dark_on_light = (self.var_mode.get() == "BLACK")
+            thr = float(self.s_bin.get())
+            do_ocr = bool(self.var_ocr.get())
+            cap = cv2.VideoCapture(video)
+            if not cap.isOpened():
+                self.log("❌ 复核:打不开视频")
+                return
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            fps = float(fps) if fps and fps > 0 else 30.0
+            w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            samples = []
+            for frac in (0.02, 0.5, 0.95):
+                f = grab_frame(cap, max(0, total * frac))
+                if f is not None:
+                    samples.append(f)
+            try:
+                content = detect_content_area(samples, w0, h0)
+            except Exception:
+                content = (0, 0, w0, h0)
+            content_h = content[3]
+            x, y, w, h = self.rect_px_in(content, "d")
+            self.log("ℹ️ 复核:内容区 %s,对话框 %s" % (content, [x, y, w, h]))
+            with open(srt_path, "r", encoding="utf-8-sig") as fp:
+                subs = list(srt.parse(fp.read()))
+            self.log("ℹ️ 复核:字幕 %d 条" % len(subs))
+            base = os.path.splitext(srt_path)[0]
+            shot_dir = base + "_check"
+            report_path = base + "_check.txt"
+            try:
+                os.makedirs(shot_dir, exist_ok=True)
+            except Exception:
+                pass
+            marks = cfg["check_mark"]
+            fracs = (0.35, 0.55, 0.75, 0.9)[:max(1, int(cfg["check_frames"]))]
+            rows = []
+            for i, sub in enumerate(subs):
+                if not self.is_processing:
+                    self.log("⚠️ 复核被停止(已做 %d/%d 条)" % (i, len(subs)))
+                    break
+                if i % 5 == 0:
+                    pct = (i * 100.0) / max(1, len(subs))
+                    self.root.after(0, lambda v=pct: self._set_check_progress(v))
+                t0 = sub.start.total_seconds()
+                t1 = sub.end.total_seconds()
+                text = (sub.content or "").strip()
+                hit = 0
+                tried = 0
+                ocr_text = ""
+                shot = None
+                for frac in fracs:
+                    frame = grab_frame(cap, (t0 + (t1 - t0) * frac) * fps)
+                    if frame is None:
+                        continue
+                    if y + h > frame.shape[0] or x + w > frame.shape[1]:
+                        continue
+                    roi = frame[y:y + h, x:x + w]
+                    if roi.size == 0:
+                        continue
+                    tried += 1
+                    if shot is None:
+                        shot = roi.copy()
+                    info = analyze_text(roi, dark_on_light, thr, content_h, cfg)
+                    if info and info.get("ok"):
+                        hit += 1
+                    elif do_ocr and tried <= 2:
+                        txt = self.processor.ocr_image(prepare_ocr_image(roi, cfg))
+                        if txt and len(txt.strip()) >= 2 and len(txt) > len(ocr_text):
+                            ocr_text = txt.strip()
+                rows.append({"n": i + 1, "t0": t0, "t1": t1, "text": text,
+                             "choice": "[Choice]" in text,
+                             "alive": (hit > 0) or bool(ocr_text),
+                             "hit": hit, "tried": tried, "ocr": ocr_text, "shot": shot})
+            dead = [r for r in rows if not r["alive"]]
+            dead_dialog = [r for r in dead if not r["choice"]]
+            dead_choice = [r for r in dead if r["choice"]]
+            saved = 0
+            for r in dead_dialog:
+                if r["shot"] is None:
+                    continue
+                name = "C%04d_%s.jpg" % (r["n"], fmt_timecode(r["t0"]).replace(":", "-"))
+                if write_image_unicode(os.path.join(shot_dir, name), r["shot"]):
+                    saved += 1
+            try:
+                with open(report_path, "w", encoding="utf-8-sig") as fp:
+                    fp.write("复核报告 %s\n" % APP_VERSION)
+                    fp.write("视频: %s\n字幕: %s\n" % (video, srt_path))
+                    fp.write("内容区 %s / 对话框 %s / 阈值 %d / 判定=%s\n"
+                             % (content, [x, y, w, h], int(thr), self.var_detect.get()))
+                    fp.write("共 %d 条,可疑 %d 条(对话框轨 %d / 选项轨 %d),存图 %d 张\n"
+                             % (len(rows), len(dead), len(dead_dialog), len(dead_choice),
+                                saved))
+                    fp.write("=" * 78 + "\n【A. 建议删掉的空行(对话框轨)】\n")
+                    for r in dead_dialog:
+                        fp.write("#%-5d %s-%s  抽%d帧没文字  %s\n"
+                                 % (r["n"], fmt_timecode(r["t0"]), fmt_timecode(r["t1"]),
+                                    r["tried"], r["text"][:40]))
+                    fp.write("\n【B. 可疑的选项行(不删,自己看一眼)】\n")
+                    for r in dead_choice:
+                        fp.write("#%-5d %s-%s  抽%d帧没文字  %s\n"
+                                 % (r["n"], fmt_timecode(r["t0"]), fmt_timecode(r["t1"]),
+                                    r["tried"], r["text"][:40]))
+                    fp.write("\n【C. 画面上有字但字幕是空的(OCR 没读出来,建议手补)】\n")
+                    for r in rows:
+                        if r["alive"] and not r["text"]:
+                            fp.write("#%-5d %s-%s  结构命中 %d 帧  OCR:%s\n"
+                                     % (r["n"], fmt_timecode(r["t0"]),
+                                        fmt_timecode(r["t1"]), r["hit"],
+                                        (r["ocr"] or "无")[:24]))
+            except Exception as exc:
+                self.log("⚠️ 复核报告写入失败: %s" % exc)
+            self.log("🔍 复核结束: 共 %d 条,可疑 %d 条(对话框 %d / 选项 %d),报告 %s"
+                     % (len(rows), len(dead), len(dead_dialog), len(dead_choice),
+                        report_path))
+            if len(rows) != len(subs):
+                self.log("ℹ️ 被中途停止,没动 SRT 文件(只出了报告)")
+                return
+            if mode.startswith("只报告+标记"):
+                marked = base + "_check.srt"
+                out = []
+                for sub, r in zip(subs, rows):
+                    c = sub.content
+                    if (not r["alive"]) and (not r["choice"]):
+                        c = marks + " " + c
+                    out.append(srt.Subtitle(index=len(out) + 1, start=sub.start,
+                                            end=sub.end, content=c))
+                with open(marked, "w", encoding="utf-8-sig") as fp:
+                    fp.write(srt.compose(out))
+                self.log("📝 已另存标记版: %s(可疑行前面加了 %s)" % (marked, marks))
+            if mode.startswith("报告+删掉"):
+                drop = set(r["n"] for r in dead_dialog)
+                keep = []
+                for sub, r in zip(subs, rows):
+                    if r["n"] in drop:
+                        continue
+                    keep.append(srt.Subtitle(index=len(keep) + 1, start=sub.start,
+                                             end=sub.end, content=sub.content))
+                try:
+                    with open(srt_path, "rb") as a, open(srt_path + ".bak", "wb") as b:
+                        b.write(a.read())
+                    with open(srt_path, "w", encoding="utf-8-sig") as fp:
+                        fp.write(srt.compose(keep))
+                    self.log("🧹 删掉 %d 条空行,原文件备份为 %s.bak" % (len(drop), srt_path))
+                except Exception as exc:
+                    self.log("⚠️ 删除失败(原文件没动): %s" % exc)
+        except Exception as exc:
+            self.log("❌ 复核出错: %s" % exc)
+            self.log(traceback.format_exc())
+        finally:
+            self.is_processing = False
+            self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL,
+                                                           text="▶️ 开始处理"))
+            self.root.after(0, lambda: self.btn_stop.config(state=tk.DISABLED))
+
     def stop_task(self):
         self.is_processing = False
         self.log("⚠️ 收到停止指令，正在安全退出...")
@@ -1111,6 +1380,7 @@ class App:
             self.log("ℹ️ 帧率 %.2ffps → 连丢 %d 帧算一句结束 / 静止 %d 帧上锁 / 消失 %d 帧结算"
                      % (fps, f_miss, f_still, f_absent))
             recs = []
+            retry_list = []
             base = os.path.splitext(self.video_path)[0]
             fail_dir = os.path.join(base + "_review", "ocr_fail")
             fail_count = [0]
@@ -1282,6 +1552,11 @@ class App:
                                 rec.nglyph = d_glyph_max
                                 rec.ocr_ok = ocr_ok
                                 rec.i0, rec.i1 = d_start, idx
+                                if not ocr_ok:
+                                    # 这句的"墨水最多那一帧"可能是空气泡(实测有这种情况),
+                                    # 等扫描结束后在它的时间范围内换几帧重试 OCR
+                                    retry_list.append((rec, [x, y, w, h],
+                                                       d_start / fps, idx / fps))
                                 prev = recs[-1] if recs else None
                                 same = (prev is not None and ocr_ok and prev.ocr_ok
                                         and prev.kind == "dialog"
@@ -1468,6 +1743,38 @@ class App:
                                                         c_glyph_max,
                                                         "有" if c_anchor_seen else "无"))
                 idx += 1
+
+            # ---- 对话轨 OCR 补救:扫描结束后再补救那些读不出文字的句子 ----
+            if do_ocr and retry_list and self.is_processing:
+                self.log("🔁 OCR 补救: %d 句要重试" % len(retry_list))
+                fixed = 0
+                tries = (0.5, 0.75, 0.9, 0.3)[:max(1, int(cfg["retry_ocr_frames"]))]
+                for rec, rect, t0, t1 in retry_list:
+                    if not self.is_processing:
+                        break
+                    rx, ry, rw, rh = rect
+                    best = ""
+                    for frac in tries:
+                        frame = grab_frame(cap, (t0 + (t1 - t0) * frac) * fps)
+                        if frame is None:
+                            continue
+                        if ry + rh > frame.shape[0] or rx + rw > frame.shape[1]:
+                            continue
+                        roi = frame[ry:ry + rh, rx:rx + rw]
+                        if roi.size == 0:
+                            continue
+                        txt = self.processor.ocr_image(prepare_ocr_image(roi, cfg))
+                        if txt and len(txt.strip()) >= 2 and len(txt.strip()) > len(best):
+                            best = txt.strip()
+                            rec.crop = roi.copy()
+                        if len(best) >= 8:
+                            break
+                    if best:
+                        rec.content = best
+                        rec.ocr_ok = True
+                        fixed += 1
+                        self.log("   ✔ 补回: %s" % best[:26])
+                self.log("🔁 补救完成: 补回 %d 句" % fixed)
 
             cap.release()
             if total > 0:
