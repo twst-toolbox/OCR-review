@@ -1,7 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V14
+V15
+
+V14 -> V15 的改动(详见 README.md):
+  1. 【修】拖放失效:ctypes 把函数指针 cast 成 c_ssize_t(那是指针类型才行的位置),
+     直接抛异常 → 日志里的"拖拽: 不可用"。改成 c_void_p,并补上 GetParent 的 restype;
+  2. 【修】打字机效果导致的碎句:墨水正在增加的那些帧不算"换句",要连续若干帧墨水
+     不再增长才允许按画面变化切断(60fps 下 1.3 的灵敏度会每多一个字就切一刀);
+  3. 【修】缝合不再要求两句"完全相等":开头 70% 一致就合并,并保留更长的那句
+     (「ひとりぼっちの主人公に」+「…になんの意味があるのだ?」合成一条);
+  4. 【改】选项改成"锁定那一刻就试 OCR":读不出字的静止画面(立绘头发/护目镜、
+     糖果装饰、黑影人物)不再锁定,继续等下一个静止瞬间;整段都读不出文字就直接丢弃,
+     不再产出 `Line N [Choice]` —— 你那条片子 40 条假选项就是这么来的。
 
 V13 -> V14 的改动(详见 README.md):
   1. 【修】OCR 不再复用事件循环。V13 把 asyncio.run 换成常驻 loop 之后,
@@ -79,6 +90,10 @@ DEFAULT_CONFIG = {
     "min_dur_choice": 0.50,
     "choice_still_seconds": 0.30,
     "choice_absent_seconds": 0.35,
+    "motion_cut_stable_frames": 3,
+    "merge_prefix_ratio": 0.7,
+    "drop_unreadable_choice": True,
+    "choice_max_tries": 3,
     "still_diff": 0.001,
     "choice_start_density": 0.004,
     "min_glyphs": 3,
@@ -183,6 +198,26 @@ def write_image_unicode(path, img):
     except Exception:
         pass
     return False
+
+
+def similar_prefix(a, b, ratio=0.7, min_chars=4):
+    """两句开头有多少字一样 —— 用来把"打字机效果"造成的碎句缝回去。
+
+    例如「ひとりぼっちの主人公に」和「ひとりぼっちの主人公になんの意味があるのだ?」
+    开头 11 个字一致,就该合成一条(保留长的那句),而不是当成两句台词。
+    OCR 尾部偶尔多个垃圾字符也没关系,只看开头。
+    """
+    if not a or not b:
+        return False
+    shorter = min(len(a), len(b))
+    if shorter < min_chars:
+        return False
+    common = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        common += 1
+    return common >= max(min_chars, int(shorter * ratio))
 
 
 def tight_crop(roi, info, cfg):
@@ -559,27 +594,32 @@ def install_drop_target(root, on_files):
 
         user32 = ctypes.windll.user32
         shell32 = ctypes.windll.shell32
-        USER32_PTR = ctypes.c_ssize_t
-        user32.GetWindowLongPtrW.restype = USER32_PTR
+        # 指针一律用 c_void_p。V14 这里写的是 c_ssize_t 加 ctypes.cast(..., c_ssize_t),
+        # 而 cast 的第二个参数必须是"指针类型",于是抛异常、拖放整个失效
+        # (日志里那句"拖拽: 不可用(用按钮加载也一样)"就是这么来的)。
+        PTR = ctypes.c_void_p
+        user32.GetParent.restype = wintypes.HWND
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetWindowLongPtrW.restype = PTR
         user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.SetWindowLongPtrW.restype = USER32_PTR
-        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, USER32_PTR]
-        user32.CallWindowProcW.restype = USER32_PTR
-        user32.CallWindowProcW.argtypes = [USER32_PTR, wintypes.HWND, ctypes.c_uint,
-                                           USER32_PTR, USER32_PTR]
-        shell32.DragQueryFileW.argtypes = [USER32_PTR, ctypes.c_uint,
+        user32.SetWindowLongPtrW.restype = PTR
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, PTR]
+        user32.CallWindowProcW.restype = ctypes.c_ssize_t
+        user32.CallWindowProcW.argtypes = [PTR, wintypes.HWND, ctypes.c_uint,
+                                           PTR, PTR]
+        shell32.DragQueryFileW.argtypes = [PTR, ctypes.c_uint,
                                            ctypes.c_wchar_p, ctypes.c_uint]
         shell32.DragQueryFileW.restype = ctypes.c_uint
-        shell32.DragFinish.argtypes = [USER32_PTR]
+        shell32.DragFinish.argtypes = [PTR]
         shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
 
         root.update_idletasks()
         hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
         wm_dropfiles = 0x0233
         gwlp_wndproc = -4
-        proc_type = ctypes.WINFUNCTYPE(USER32_PTR, wintypes.HWND, ctypes.c_uint,
-                                       USER32_PTR, USER32_PTR)
-        old_proc = user32.GetWindowLongPtrW(hwnd, gwlp_wndproc)
+        proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint,
+                                       PTR, PTR)
+        old_proc = user32.GetWindowLongPtrW(hwnd, gwlp_wndproc) or 0
 
         def handler(h, msg, wparam, lparam):
             if msg == wm_dropfiles:
@@ -599,7 +639,7 @@ def install_drop_target(root, on_files):
             return user32.CallWindowProcW(old_proc, h, msg, wparam, lparam)
 
         proc = proc_type(handler)
-        user32.SetWindowLongPtrW(hwnd, gwlp_wndproc, ctypes.cast(proc, USER32_PTR))
+        user32.SetWindowLongPtrW(hwnd, gwlp_wndproc, ctypes.cast(proc, PTR))
         shell32.DragAcceptFiles(hwnd, True)
         root._drop_proc = proc
         return True
@@ -1105,6 +1145,8 @@ class App:
             d_best_roi = None
             d_best_info = None
             d_mask_prev = None
+            d_prev_density = 0.0
+            d_stable = 99
 
             # 选项轨状态
             c_active = False
@@ -1118,6 +1160,10 @@ class App:
             c_best_info = None
             c_fallback_roi = None
             c_fallback_info = None
+            c_text = None
+            c_text_roi = None
+            c_text_info = None
+            c_tries = 0
             c_mask_prev = None
             c_anchor_seen = False
 
@@ -1159,6 +1205,8 @@ class App:
                             d_best_density = density
                             d_best_roi = roi_d.copy()
                             d_best_info = d_info
+                            d_prev_density = density
+                            d_stable = 0
                     else:
                         if has_text:
                             d_miss = 0
@@ -1178,8 +1226,17 @@ class App:
                                            d_peak * cfg["cut_peak_ratio"]):
                             should_cut = True
                         elif (has_text and diff_score > p_diff
+                              and d_stable >= int(cfg["motion_cut_stable_frames"])
                               and (idx - d_start) / fps > cfg["motion_cut_after"]):
                             should_cut = True
+
+                        # 打字机效果会让墨水一路变多,那时候不是"换句",不能切。
+                        # 连续若干帧墨水不再增长,才允许按"画面变化"切断。
+                        if density > d_prev_density + 0.0005:
+                            d_stable = 0
+                        else:
+                            d_stable += 1
+                        d_prev_density = density
 
                         if should_cut:
                             dur = (idx - d_start) / fps
@@ -1194,13 +1251,19 @@ class App:
                                 rec.ocr_ok = ocr_ok
                                 rec.i0, rec.i1 = d_start, idx
                                 prev = recs[-1] if recs else None
-                                if (prev is not None and ocr_ok and prev.ocr_ok
+                                same = (prev is not None and ocr_ok and prev.ocr_ok
                                         and prev.kind == "dialog"
-                                        and prev.content == content_d
-                                        and 0 <= (d_start - prev.i1) <= int(fps * 3)):
+                                        and (prev.content == content_d
+                                             or similar_prefix(prev.content, content_d,
+                                                                cfg["merge_prefix_ratio"]))
+                                        and 0 <= (d_start - prev.i1) <= int(fps * 3))
+                                if same:
                                     prev.et = et
                                     prev.i1 = idx
-                                    self.log("🔄 缝合对话碎片: %s..." % content_d[:10])
+                                    if len(content_d) > len(prev.content):
+                                        prev.content = content_d   # 打字机:留最完整那句
+                                        prev.crop = rec.crop
+                                    self.log("🔄 缝合对话碎片: %s..." % prev.content[:12])
                                 else:
                                     recs.append(rec)
                                     self.log("✅ 对话: %s..." % content_d[:15])
@@ -1216,6 +1279,8 @@ class App:
                                 d_best_density = density
                                 d_best_roi = roi_d.copy()
                                 d_best_info = d_info
+                                d_prev_density = density
+                                d_stable = 0
                             else:
                                 d_active = False
                                 d_peak = 0.0
@@ -1264,6 +1329,11 @@ class App:
                             c_best_info = None
                             c_fallback_roi = roi_c.copy()
                             c_fallback_info = c_info
+                            c_text = None
+                            c_text_roi = None
+                            c_text_info = None
+                            c_tries = 0
+                            c_anchor_seen = anchor is not None
                     else:
                         if is_choice:
                             c_empty = 0
@@ -1276,11 +1346,28 @@ class App:
                             if not c_locked:
                                 if diff_c < cfg["still_diff"]:
                                     c_still += 1
-                                    if c_still >= f_still:
-                                        c_best_roi = roi_c.copy()
-                                        c_best_info = c_info
-                                        c_locked = True
-                                        self.log("📸[选项快门] 发现完美静止画面，锁定！")
+                                    if (c_still >= f_still
+                                            and c_tries < int(cfg["choice_max_tries"])):
+                                        c_tries += 1
+                                        # 锁定的同时立刻试一次 OCR:认不出字就说明这里不是真选项
+                                        # (立绘的头发/护目镜、糖果装饰、黑影人物都能骗过前面几道
+                                        # 判定,但都读不出文字),那就先不锁,等下一个静止瞬间再试。
+                                        ok_now, text_now, roi_now = ocr_of(
+                                            roi_c, c_info, "", "tight")
+                                        if ok_now:
+                                            c_best_roi = roi_c.copy()
+                                            c_best_info = c_info
+                                            c_text = text_now
+                                            c_text_roi = roi_now
+                                            c_text_info = c_info
+                                            c_locked = True
+                                            self.log("📸[选项快门] 锁定并读出: %s"
+                                                     % text_now[:20])
+                                        else:
+                                            c_still = 0
+                                            if verbose:
+                                                self.log("   ⏳ 静止了但读不出字,继续等"
+                                                         "(第 %d 次尝试)" % c_tries)
                                 else:
                                     c_still = 0
                         else:
@@ -1292,38 +1379,52 @@ class App:
                                 if dur_c > cfg["min_dur_choice"]:
                                     st_c = datetime.timedelta(seconds=c_start / fps)
                                     et_c = datetime.timedelta(seconds=real_end / fps)
-                                    if c_locked:
-                                        target_roi, target_info = c_best_roi, c_best_info
+                                    text_c = c_text
+                                    used_c = c_text_roi
+                                    if not text_c:
+                                        # 整段都没锁上:拿"墨水最多那一帧"再试最后一次
+                                        ok_last, text_last, roi_last = ocr_of(
+                                            c_fallback_roi, c_fallback_info, "", "tight")
+                                        if ok_last:
+                                            text_c = text_last
+                                            used_c = roi_last
+                                    if text_c:
+                                        content_c = "%s [Choice]" % text_c
+                                        ocr_ok_c = True
                                     else:
-                                        target_roi, target_info = (c_fallback_roi,
-                                                                   c_fallback_info)
-                                    ocr_ok_c, content_c, used_c = ocr_of(
-                                        target_roi, target_info, "Line [Choice]",
-                                        "tight")
-                                    if ocr_ok_c:
-                                        content_c = "%s [Choice]" % content_c
-                                    rec = Rec(st_c, et_c, content_c, "choice")
-                                    rec.crop = used_c
-                                    rec.nglyph = c_glyph_max
-                                    rec.ocr_ok = ocr_ok_c
-                                    rec.anchor = c_anchor_seen
-                                    rec.i0, rec.i1 = c_start, real_end
-                                    prev = recs[-1] if recs else None
-                                    if (prev is not None and ocr_ok_c and prev.ocr_ok
-                                            and prev.content == content_c
-                                            and 0 <= (c_start - prev.i1) <= int(fps * 3)):
-                                        prev.et = et_c
-                                        prev.i1 = real_end
-                                        self.log("🔄 缝合选项碎片: %s..." % content_c[:10])
+                                        content_c = "Line [Choice]"
+                                        ocr_ok_c = False
+                                    if ((not ocr_ok_c)
+                                            and cfg.get("drop_unreadable_choice", True)):
+                                        # 真选项一定有字;读不出字的这一整段基本都是立绘/背景
+                                        # 装饰骗过判定,直接丢掉,不再产出 Line N [Choice]
+                                        self.log("🗑️ 丢弃读不出文字的选项段(%.2fs,圆钮=%s)"
+                                                 % (dur_c, "有" if c_anchor_seen else "无"))
                                     else:
-                                        recs.append(rec)
-                                        self.log("🔹 选项结算: %s..." % content_c[:15])
-                                    if verbose:
-                                        self.log("   └ idx=%d 时长=%.2fs 锁=%s 字形=%d 圆钮=%s"
-                                                 % (idx, dur_c,
-                                                    "是" if c_locked else "否",
-                                                    c_glyph_max,
-                                                    "有" if c_anchor_seen else "无"))
+                                        rec = Rec(st_c, et_c, content_c, "choice")
+                                        rec.crop = used_c
+                                        rec.nglyph = c_glyph_max
+                                        rec.ocr_ok = ocr_ok_c
+                                        rec.anchor = c_anchor_seen
+                                        rec.i0, rec.i1 = c_start, real_end
+                                        prev = recs[-1] if recs else None
+                                        if (prev is not None and ocr_ok_c and prev.ocr_ok
+                                                and prev.content == content_c
+                                                and 0 <= (c_start - prev.i1) <= int(fps * 3)):
+                                            prev.et = et_c
+                                            prev.i1 = real_end
+                                            self.log("🔄 缝合选项碎片: %s..."
+                                                     % content_c[:10])
+                                        else:
+                                            recs.append(rec)
+                                            self.log("🔹 选项结算: %s..." % content_c[:15])
+                                        if verbose:
+                                            self.log("   └ idx=%d 时长=%.2fs 锁=%s 字形=%d "
+                                                     "圆钮=%s"
+                                                     % (idx, dur_c,
+                                                        "是" if c_locked else "否",
+                                                        c_glyph_max,
+                                                        "有" if c_anchor_seen else "无"))
                 idx += 1
 
             cap.release()
