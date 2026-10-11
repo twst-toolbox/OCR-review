@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V15
+V16
+
+V15 -> V16 的改动(详见 README.md)。这一版的原则是"宁可多,不可漏":
+  1. 【重要】对话框默认改回 V12 的"只数墨水"判据。结构判据要求"≥3 个字形 + 占框宽
+     25%",2~4 个字的短句达不到 —— 拿那份翻译稿逐条对过:7 分钟里翻译稿 105 条、
+     V15 只出 99 条,少掉的 12 条全是「硬糖!?」「嗯?」「不要不要不要~!!」这类短句,
+     连占位行都没有。现在默认"墨水判定"(不漏,可能多);结构判定留在下拉框里;
+  2. 墨水判据改成跟界面上的阈值滑杆走(V15 的 legacy 模式写死用配置里的值);
+  3. 选项加一道"像不像日语"的过滤:背景招牌读出来的 "f1NISH"、")0"、",ノ"、"すR"
+     这类垃圾选项全部丢掉;
+  4. 选项锁定时把开始时间对齐到"这个静止窗口的开头",不再把前面被误判的十几秒算进去。
 
 V14 -> V15 的改动(详见 README.md):
   1. 【修】拖放失效:ctypes 把函数指针 cast 成 c_ssize_t(那是指针类型才行的位置),
@@ -93,6 +103,7 @@ DEFAULT_CONFIG = {
     "motion_cut_stable_frames": 3,
     "merge_prefix_ratio": 0.7,
     "drop_unreadable_choice": True,
+    "choice_min_jp_chars": 2,
     "choice_max_tries": 3,
     "still_diff": 0.001,
     "choice_start_density": 0.004,
@@ -119,7 +130,7 @@ DEFAULT_CONFIG = {
     "anchor_h_min_ratio": 0.035,
     "anchor_h_max_ratio": 0.20,
     "require_anchor_in_white_mode": False,
-    "detect_mode": "structure",
+    "detect_mode": "legacy",
     "review_mode": "report",
     "ocr_crop_to_text": True,
     "enable_drag_drop": True,
@@ -218,6 +229,21 @@ def similar_prefix(a, b, ratio=0.7, min_chars=4):
             break
         common += 1
     return common >= max(min_chars, int(shorter * ratio))
+
+
+def jp_char_count(text):
+    """数一句话里有多少假名/汉字。
+
+    用来把从背景招牌上读来的垃圾选项滤掉:实测出现过 "f1NISH"(FINISH 横幅)、
+    ")0"、",ノ"、"すR" 这种,而真选项(比如「信じられない」)全是假名。
+    """
+    count = 0
+    for ch in text or "":
+        code = ord(ch)
+        if (0x3040 <= code <= 0x30FF or 0x4E00 <= code <= 0x9FFF
+                or 0x3400 <= code <= 0x4DBF):
+            count += 1
+    return count
 
 
 def tight_crop(roi, info, cfg):
@@ -415,11 +441,16 @@ def analyze_text_auto(roi, dark_on_light, thr, content_h, cfg, prev_mask=None):
     return info
 
 
-def legacy_density(roi, dark_on_light, cfg, prev_mask=None):
-    """V12 的老判据(二值化墨水占比),给 detect_mode=legacy 留条后路。"""
+def legacy_density(roi, dark_on_light, thr, cfg, prev_mask=None):
+    """V12 的老判据:只数墨水(二值化后的像素占比)。
+
+    V16 起这是对话框的默认判据。原因是结构判据要求"至少 3 个字形 + 占框宽 25%",
+    而 2~4 个字的短句天生达不到 —— 实测那一版把 105 条里的 12 条整个丢掉了,
+    丢的全是「硬糖!?」「嗯?」「不要不要不要~!!」这类短句,连 Line N 占位都没有。
+    只数墨水就不会漏:短句照样成行,顶多 OCR 读不出、留个占位行给你手补。
+    """
     height, width = roi.shape[:2]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    thr = cfg["bin_threshold_twst"] if dark_on_light else cfg["bin_threshold_white"]
     if dark_on_light:
         _, ink = cv2.threshold(gray, int(thr), 255, cv2.THRESH_BINARY_INV)
     else:
@@ -728,11 +759,11 @@ class App:
                        value="WHITE").pack(side=tk.LEFT, padx=10)
 
         init_detect = ("结构判定" if str(self.cfg.get("detect_mode", "structure")).startswith("str")
-                       else "传统判定")
+                       else "墨水判定")
         self.var_detect = tk.StringVar(value=init_detect)
         tk.Label(f_top2, text="判定:").pack(side=tk.LEFT, padx=(14, 2))
         ttk.Combobox(f_top2, textvariable=self.var_detect, width=10, state="readonly",
-                     values=("结构判定", "传统判定")).pack(side=tk.LEFT)
+                     values=("结构判定", "墨水判定")).pack(side=tk.LEFT)
 
         init_review = {"off": "关闭", "report": "只报告", "report+delete": "报告并删除"}.get(
             str(self.cfg.get("review_mode", "report")), "只报告")
@@ -1059,7 +1090,7 @@ class App:
             thr = float(self.s_bin.get())
             p_diff = float(self.s_diff.get()) / 100.0
             do_ocr = bool(self.var_ocr.get())
-            use_structure = (self.var_detect.get() != "传统判定")
+            use_structure = (self.var_detect.get() != "墨水判定")
             review_mode = {"关闭": "off", "只报告": "report",
                            "报告并删除": "report+delete"}.get(
                                self.var_review.get(), "report")
@@ -1187,7 +1218,8 @@ class App:
                         d_info = analyze_text_auto(roi_d, dark_on_light, thr,
                                                    content_h, cfg, d_mask_prev)
                     else:
-                        d_info = legacy_density(roi_d, dark_on_light, cfg, d_mask_prev)
+                        d_info = legacy_density(roi_d, dark_on_light, thr, cfg,
+                                                d_mask_prev)
                     if d_info is not None:
                         d_mask_prev = d_info["mask"].copy()
 
@@ -1303,7 +1335,8 @@ class App:
                         c_info = analyze_text_auto(roi_c, dark_on_light, thr,
                                                    content_h, cfg, c_mask_prev)
                     else:
-                        c_info = legacy_density(roi_c, dark_on_light, cfg, c_mask_prev)
+                        c_info = legacy_density(roi_c, dark_on_light, thr, cfg,
+                                                c_mask_prev)
                     if c_info is not None:
                         c_mask_prev = c_info["mask"].copy()
                     if anchor is not None:
@@ -1361,6 +1394,9 @@ class App:
                                             c_text_roi = roi_now
                                             c_text_info = c_info
                                             c_locked = True
+                                            # 选项真正出现的时刻是这个静止窗口的开头,
+                                            # 不是这段(可能被误判)开始的时候
+                                            c_start = max(c_start, idx - f_still)
                                             self.log("📸[选项快门] 锁定并读出: %s"
                                                      % text_now[:20])
                                         else:
@@ -1388,6 +1424,12 @@ class App:
                                         if ok_last:
                                             text_c = text_last
                                             used_c = roi_last
+                                    if (text_c and jp_char_count(text_c)
+                                            < int(cfg["choice_min_jp_chars"])):
+                                        if verbose:
+                                            self.log("   ⚠️ 选项文字不像日语,当没读出: %r"
+                                                     % text_c[:16])
+                                        text_c = None
                                     if text_c:
                                         content_c = "%s [Choice]" % text_c
                                         ocr_ok_c = True
