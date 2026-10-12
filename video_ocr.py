@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V18
+V19
+
+V18 -> V19 的改动(详见 README.md):
+  1. 【改】选项轨只输出"读得出日文"的选项:结构判据 + 圆钮 + OCR 必须读出假名/汉字,
+     三者齐了才写一行 `文字 [Choice]`;读不出文字的整段直接丢掉。
+     依据:实测真实选项(1:13 的「信じられない」)读得出来,而 40 张假选项的候选图
+     一张都读不出文字 —— 这一条能一次性解决"满江红"。
+  2. 界面新增「选项轨」勾选框(默认开):不想跑就取消勾选,不必去改 json。
+  3. 顺带提醒:从压缩包临时目录运行时 video_ocr_config.json 每次都会重新生成,
+     所以能按到的界面开关才是可靠的。
 
 V17 -> V18 的改动(详见 README.md):
   1. 【修】选项轨重新用结构判据,不再跟着"判定"下拉框走。V17 里它跟着变成"墨水判定"
@@ -124,7 +133,7 @@ DEFAULT_CONFIG = {
     "choice_absent_seconds": 0.35,
     "motion_cut_stable_frames": 3,
     "merge_prefix_ratio": 0.7,
-    "drop_unreadable_choice": False,
+    "drop_unreadable_choice": True,
     "choice_min_jp_chars": 2,
     "choice_max_tries": 3,
     "retry_ocr_frames": 0,
@@ -823,6 +832,13 @@ class App:
         if not HAS_WIN_OCR:
             cb_ocr.config(state=tk.DISABLED, text="OCR不可用")
 
+        # 选项轨开关放到界面上:从压缩包临时目录运行时 json 每次都重新生成,
+        # 改 json 等于没用,所以这类开关必须在界面上能按到。
+        self.var_choice = tk.BooleanVar(value=bool(self.cfg.get("use_choice_track", True)))
+        tk.Checkbutton(f_top2, text="选项轨", variable=self.var_choice,
+                       font=("微软雅黑", 10, "bold"), fg="#a0522d"
+                       ).pack(side=tk.LEFT, padx=(14, 0))
+
         self.var_verbose = tk.BooleanVar(value=True)
         tk.Checkbutton(f_top2, text="诊断日志", variable=self.var_verbose).pack(side=tk.LEFT)
 
@@ -1439,6 +1455,8 @@ class App:
                                self.var_review.get(), "report")
             verbose = bool(self.var_verbose.get())
             require_anchor = dark_on_light or bool(cfg["require_anchor_in_white_mode"])
+            use_choice_track = bool(self.var_choice.get())
+            drop_unreadable_choice = bool(cfg.get("drop_unreadable_choice", True))
 
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
@@ -1672,7 +1690,7 @@ class App:
 
                 # ---------- 选项轨 ----------
                 xc, yc, wc, hc = rect_c
-                if not cfg.get("use_choice_track", True):
+                if not use_choice_track:
                     xc = yc = wc = hc = 0          # 关掉选项轨:整段跳过
                 c_info = None
                 roi_c = None
@@ -1798,8 +1816,7 @@ class App:
                                     else:
                                         content_c = "Line [Choice]"
                                         ocr_ok_c = False
-                                    if ((not ocr_ok_c)
-                                            and cfg.get("drop_unreadable_choice", True)):
+                                    if (not ocr_ok_c) and drop_unreadable_choice:
                                         # 真选项一定有字;读不出字的这一整段基本都是立绘/背景
                                         # 装饰骗过判定,直接丢掉,不再产出 Line N [Choice]
                                         self.log("🗑️ 丢弃读不出文字的选项段(%.2fs,圆钮=%s)"
