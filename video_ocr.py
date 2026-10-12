@@ -1,7 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V19
+V20
+
+V19 -> V20 的改动(详见 README.md):
+  1. 【新】默认判据换成「泡泡判定」(界面下拉框里的第一项):框里必须是一大片
+     "平整的浅色泡泡"而且有墨水 —— 这是原版米色判据的加强版,多加了一条
+     "泡泡内部的颜色必须是平的"。天空有渐变、沙地有花纹、立绘和糖果花里胡哨,都过不了;
+     而且它不看字数,所以两个字的短句也算,不会再重复"短句被整个丢掉"的老毛病。
+  2. 【修】选项轨不再要求"OCR 必须读出日文"。V19 那条太狠:真选项只要那一帧没读出来,
+     整段就消失了 —— 1 小时片子里只活下来 2 条,而你对照完整 SRT 看到有很多选项。
+     现在 泡泡+墨水+(圆钮 或 文字行) 就算一行选项,读得出文字就带上,
+     读不出就留 `Line N [Choice]` 占位行,至少时间轴对得上、你能手动定位。
+  3. 三种判据都在界面下拉框里(泡泡 / 结构 / 墨水),哪个顺手用哪个,不用重新编译。
 
 V18 -> V19 的改动(详见 README.md):
   1. 【改】选项轨只输出"读得出日文"的选项:结构判据 + 圆钮 + OCR 必须读出假名/汉字,
@@ -133,7 +144,7 @@ DEFAULT_CONFIG = {
     "choice_absent_seconds": 0.35,
     "motion_cut_stable_frames": 3,
     "merge_prefix_ratio": 0.7,
-    "drop_unreadable_choice": True,
+    "drop_unreadable_choice": False,
     "choice_min_jp_chars": 2,
     "choice_max_tries": 3,
     "retry_ocr_frames": 0,
@@ -171,7 +182,11 @@ DEFAULT_CONFIG = {
     "anchor_h_min_ratio": 0.035,
     "anchor_h_max_ratio": 0.20,
     "require_anchor_in_white_mode": False,
-    "detect_mode": "legacy",
+    "detect_mode": "bubble",
+    "bubble_ratio_min": 0.40,
+    "bubble_sat_max": 100,
+    "bubble_v_min": 120,
+    "bubble_spread_max": 55,
     "review_mode": "report",
     "ocr_crop_to_text": True,
     "enable_drag_drop": True,
@@ -517,6 +532,45 @@ def legacy_density(roi, dark_on_light, thr, cfg, prev_mask=None):
     }
 
 
+def bubble_stats(roi, cfg):
+    """看看这块地方是不是"一大片平整的浅色泡泡"。
+
+    这是原版那个米色占比判据的加强版:原版只看"浅色占多少",所以天空、沙子、
+    白栅栏都能骗过它;这里再加一条 —— 泡泡内部的颜色必须是"平的"(颜色跨度小),
+    而天空有渐变、沙地有花纹、立绘和糖果更是花里胡哨,都过不了这一关。
+    好处是不看字数(短句照样算),也不看位置。
+    返回 (浅色占比, 底色跨度, 是否像泡泡)。
+    """
+    try:
+        h, w = roi.shape[:2]
+        bgr = roi.reshape(-1, 3).astype(np.int16)
+        mx = bgr.max(axis=1)
+        mn = bgr.min(axis=1)
+        sat = np.where(mx > 0, (mx - mn) * 255 // np.maximum(mx, 1), 0)
+        pale = (sat < cfg["bubble_sat_max"]) & (mx >= cfg["bubble_v_min"])
+        ratio = float(pale.mean())
+        gray = ((bgr[:, 2] * 29 + bgr[:, 1] * 150 + bgr[:, 0] * 77) >> 8)
+        vals = gray[pale]
+        if vals.size < 50:
+            return ratio, 999.0, False
+        spread = float(np.percentile(vals, 90) - np.percentile(vals, 10))
+        ok = (ratio >= cfg["bubble_ratio_min"]
+              and spread <= cfg["bubble_spread_max"])
+        return ratio, spread, ok
+    except Exception:
+        return 0.0, 999.0, False
+
+
+def bubble_density(roi, dark_on_light, thr, cfg, prev_mask=None):
+    """泡泡判定:框里得是一大片平整的浅色泡泡,而且里面有墨水。"""
+    info = legacy_density(roi, dark_on_light, thr, cfg, prev_mask)
+    ratio, spread, flat = bubble_stats(roi, cfg)
+    info["bubble_ratio"] = ratio
+    info["bubble_spread"] = spread
+    info["ok"] = bool(flat and info["ink_density"] >= cfg["text_start_density"])
+    return info
+
+
 def find_anchor(frame, rect_px, content, cfg):
     """在框的左边和上下找棕色底的黑色圆钮(▶),返回 (x, y, w, h) 或 None。"""
     cx0, cy0, cw, chh = content
@@ -811,12 +865,13 @@ class App:
         tk.Radiobutton(f_top2, text="18TRIP (白字)", variable=self.var_mode,
                        value="WHITE").pack(side=tk.LEFT, padx=10)
 
-        init_detect = ("结构判定" if str(self.cfg.get("detect_mode", "structure")).startswith("str")
-                       else "墨水判定")
+        _dm = str(self.cfg.get("detect_mode", "bubble"))
+        init_detect = ("泡泡判定" if _dm.startswith("bub")
+                       else ("结构判定" if _dm.startswith("str") else "墨水判定"))
         self.var_detect = tk.StringVar(value=init_detect)
         tk.Label(f_top2, text="判定:").pack(side=tk.LEFT, padx=(14, 2))
         ttk.Combobox(f_top2, textvariable=self.var_detect, width=10, state="readonly",
-                     values=("结构判定", "墨水判定")).pack(side=tk.LEFT)
+                     values=("泡泡判定", "结构判定", "墨水判定")).pack(side=tk.LEFT)
 
         init_review = {"off": "关闭", "report": "只报告", "report+delete": "报告并删除"}.get(
             str(self.cfg.get("review_mode", "report")), "只报告")
@@ -1449,7 +1504,9 @@ class App:
             thr = float(self.s_bin.get())
             p_diff = float(self.s_diff.get()) / 100.0
             do_ocr = bool(self.var_ocr.get())
-            use_structure = (self.var_detect.get() != "墨水判定")
+            detect_mode = self.var_detect.get()
+            use_bubble = detect_mode.startswith("泡泡")
+            use_structure = (not use_bubble) and detect_mode.startswith("结构")
             review_mode = {"关闭": "off", "只报告": "report",
                            "报告并删除": "report+delete"}.get(
                                self.var_review.get(), "report")
@@ -1576,7 +1633,10 @@ class App:
                 if (w > 1 and h > 1 and y + h <= frame.shape[0]
                         and x + w <= frame.shape[1]):
                     roi_d = frame[y:y + h, x:x + w]
-                    if use_structure:
+                    if use_bubble:
+                        d_info = bubble_density(roi_d, dark_on_light, thr, cfg,
+                                                d_mask_prev)
+                    elif use_structure:
                         d_info = analyze_text_auto(roi_d, dark_on_light, thr,
                                                    content_h, cfg, d_mask_prev)
                     else:
@@ -1703,7 +1763,10 @@ class App:
                     # 选项轨一律用结构判据,不跟着"判定"下拉框走。
                     # V17 把它跟着改成"墨水判定"之后,选项段在花花绿绿的背景上
                     # 永远关不掉 —— 实测出现过 97 秒、60 秒这种假选项段。
-                    if use_structure or cfg.get("choice_use_structure", True):
+                    if use_bubble:
+                        c_info = bubble_density(roi_c, dark_on_light, thr, cfg,
+                                                c_mask_prev)
+                    elif use_structure or cfg.get("choice_use_structure", True):
                         c_info = analyze_text_auto(roi_c, dark_on_light, thr,
                                                    content_h, cfg, c_mask_prev)
                     else:
@@ -1718,8 +1781,18 @@ class App:
                     density_c = c_info["ink_density"]
                     diff_c = c_info["diff_score"]
                     anchor_ok = (not require_anchor) or (anchor is not None)
-                    is_choice = (bool(c_info["ok"]) and anchor_ok
-                                 and density_c >= cfg["choice_start_density"])
+                    if use_bubble:
+                        # 泡泡判定下:平整浅色泡泡 + 有墨水,再加上"圆钮 或 文字行"
+                        # 之一(天空也平整,但它既没圆钮也没字形,所以挡得住)
+                        is_choice = (bool(c_info["ok"])
+                                     and density_c >= cfg["choice_start_density"])
+                        if is_choice and anchor is None:
+                            text_row = analyze_text_auto(roi_c, dark_on_light, thr,
+                                                         content_h, cfg, None)
+                            is_choice = bool(text_row and text_row["ok"])
+                    else:
+                        is_choice = (bool(c_info["ok"]) and anchor_ok
+                                     and density_c >= cfg["choice_start_density"])
 
                     if not c_active:
                         if is_choice:
