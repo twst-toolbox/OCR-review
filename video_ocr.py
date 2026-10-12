@@ -1,7 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V17
+V18
+
+V17 -> V18 的改动(详见 README.md):
+  1. 【修】选项轨重新用结构判据,不再跟着"判定"下拉框走。V17 里它跟着变成"墨水判定"
+     之后,选项段在那片花花绿绿的背景上永远关不掉 —— 实测 12 条选项里 7 条时长离谱
+     (97 秒 / 60 秒 / 46 秒 / 39 秒 …),把中间的对话全包进去了;
+  2. 【修】"选项还在"改成 = 框里有文字行 **且** 圆钮还在;另加保险丝:超过 12 秒的
+     选项段强制结算;
+  3. 新增 `use_choice_track` 开关,嫌选项轨吵可以整个关掉(默认开);
+  4. 【取消】OCR 多帧补救按你的要求关掉了(`retry_ocr_frames: 0`):短句就留空白 Line 行,
+     不做猜测。想再打开把它设成 4 即可;
+  5. 【修】复核窗口:连点只会开一个;选完文件把窗口抬回前面;跑完弹提示;
+  6. 【修】复核选项行时改用"选项框"去核(以前用对话框的框,周围的对话会替它作证,
+     12 条假选项只揪出 1 条)。
 
 V16 -> V17 的改动(详见 README.md):
   1. 选项标记回归:读不出文字的选项段也输出 `Line N [Choice]`(方便人工定位),
@@ -114,9 +127,16 @@ DEFAULT_CONFIG = {
     "drop_unreadable_choice": False,
     "choice_min_jp_chars": 2,
     "choice_max_tries": 3,
-    "retry_ocr_frames": 4,
+    "retry_ocr_frames": 0,
+    "use_choice_track": True,
+    "choice_use_structure": True,
+    "choice_max_seconds": 12.0,
     "check_frames": 4,
     "check_mark": "[?]",
+    "check_min_glyphs": 2,
+    "check_span_ratio": 0.08,
+    "check_ocr_frames": 4,
+    "check_min_seconds": 0.6,
     "still_diff": 0.001,
     "choice_start_density": 0.004,
     "min_glyphs": 3,
@@ -1093,6 +1113,16 @@ class App:
     # ---------------- 任务控制 ----------------
     # ---------------- 复核:视频 + SRT → 只报告 / 标记 / 删空行 ----------------
     def open_check_window(self):
+        # 已经开着就别再开一个(V17 里连点会开出好几个,自己都找不着)
+        try:
+            if (getattr(self, "chk_win", None) is not None
+                    and self.chk_win.winfo_exists()):
+                self.chk_win.deiconify()
+                self.chk_win.lift()
+                self.chk_win.focus_force()
+                return
+        except Exception:
+            pass
         win = tk.Toplevel(self.root)
         win.title("复核:视频 + SRT")
         win.geometry("790x340")
@@ -1135,12 +1165,22 @@ class App:
                  ).pack(anchor="w", padx=12, pady=4)
 
     def _pick_file(self, var, is_srt):
+        parent = getattr(self, "chk_win", None)
         if is_srt:
-            p = filedialog.askopenfilename(filetypes=[("字幕", "*.srt"), ("所有", "*.*")])
+            p = filedialog.askopenfilename(
+                parent=parent, filetypes=[("字幕", "*.srt"), ("所有", "*.*")])
         else:
-            p = filedialog.askopenfilename()
+            p = filedialog.askopenfilename(parent=parent)
         if p:
             var.set(p)
+        # 选完把复核窗口抬回前面(V17 里它会躲到主窗口后面,看着像被关掉了)
+        try:
+            if parent is not None:
+                parent.deiconify()
+                parent.lift()
+                parent.focus_force()
+        except Exception:
+            pass
 
     def _set_check_progress(self, value):
         try:
@@ -1199,8 +1239,10 @@ class App:
             except Exception:
                 content = (0, 0, w0, h0)
             content_h = content[3]
-            x, y, w, h = self.rect_px_in(content, "d")
-            self.log("ℹ️ 复核:内容区 %s,对话框 %s" % (content, [x, y, w, h]))
+            xd, yd, wd, hd = self.rect_px_in(content, "d")
+            xc2, yc2, wc2, hc2 = self.rect_px_in(content, "c")
+            self.log("ℹ️ 复核:内容区 %s,对话框 %s,选项框 %s"
+                     % (content, [xd, yd, wd, hd], [xc2, yc2, wc2, hc2]))
             with open(srt_path, "r", encoding="utf-8-sig") as fp:
                 subs = list(srt.parse(fp.read()))
             self.log("ℹ️ 复核:字幕 %d 条" % len(subs))
@@ -1213,6 +1255,12 @@ class App:
                 pass
             marks = cfg["check_mark"]
             fracs = (0.35, 0.55, 0.75, 0.9)[:max(1, int(cfg["check_frames"]))]
+            # 复核用的判据要比打轴松一点:打轴要求"≥3 个字"是为了不误触发,
+            # 但复核是在判断"这条到底有没有字",两个字的气泡(比如「嗯?」)
+            # 也必须算有字 —— V17 用同一套严格判据,把它们当空行删掉了。
+            chk_cfg = dict(cfg)
+            chk_cfg["min_glyphs"] = max(1, int(cfg["check_min_glyphs"]))
+            chk_cfg["row_span_min_ratio"] = float(cfg["check_span_ratio"])
             rows = []
             for i, sub in enumerate(subs):
                 if not self.is_processing:
@@ -1224,6 +1272,12 @@ class App:
                 t0 = sub.start.total_seconds()
                 t1 = sub.end.total_seconds()
                 text = (sub.content or "").strip()
+                # 选项行要拿"选项框"去核,不能用对话框的框 ——
+                # 否则周围的对话会替它作证,V17 里 12 条假选项只揪出 1 条就是这个原因
+                if "[Choice]" in text:
+                    x, y, w, h = xc2, yc2, wc2, hc2
+                else:
+                    x, y, w, h = xd, yd, wd, hd
                 hit = 0
                 tried = 0
                 ocr_text = ""
@@ -1240,16 +1294,20 @@ class App:
                     tried += 1
                     if shot is None:
                         shot = roi.copy()
-                    info = analyze_text(roi, dark_on_light, thr, content_h, cfg)
+                    info = analyze_text(roi, dark_on_light, thr, content_h, chk_cfg)
                     if info and info.get("ok"):
                         hit += 1
-                    elif do_ocr and tried <= 2:
+                    elif do_ocr and tried <= int(cfg["check_ocr_frames"]):
                         txt = self.processor.ocr_image(prepare_ocr_image(roi, cfg))
                         if txt and len(txt.strip()) >= 2 and len(txt) > len(ocr_text):
                             ocr_text = txt.strip()
+                dur_line = max(0.0, t1 - t0)
+                too_short = dur_line < float(cfg["check_min_seconds"])
                 rows.append({"n": i + 1, "t0": t0, "t1": t1, "text": text,
                              "choice": "[Choice]" in text,
-                             "alive": (hit > 0) or bool(ocr_text),
+                             "short": too_short,
+                             # 太短的行证据不足,一律不删(宁可留给你手看)
+                             "alive": (hit > 0) or bool(ocr_text) or too_short,
                              "hit": hit, "tried": tried, "ocr": ocr_text, "shot": shot})
             dead = [r for r in rows if not r["alive"]]
             dead_dialog = [r for r in dead if not r["choice"]]
@@ -1266,7 +1324,8 @@ class App:
                     fp.write("复核报告 %s\n" % APP_VERSION)
                     fp.write("视频: %s\n字幕: %s\n" % (video, srt_path))
                     fp.write("内容区 %s / 对话框 %s / 阈值 %d / 判定=%s\n"
-                             % (content, [x, y, w, h], int(thr), self.var_detect.get()))
+                             % (content, [xd, yd, wd, hd], int(thr),
+                                self.var_detect.get()))
                     fp.write("共 %d 条,可疑 %d 条(对话框轨 %d / 选项轨 %d),存图 %d 张\n"
                              % (len(rows), len(dead), len(dead_dialog), len(dead_choice),
                                 saved))
@@ -1287,6 +1346,13 @@ class App:
                                      % (r["n"], fmt_timecode(r["t0"]),
                                         fmt_timecode(r["t1"]), r["hit"],
                                         (r["ocr"] or "无")[:24]))
+                    fp.write("\n【D. 太短没敢删的(证据不足,自己看一眼)】\n")
+                    for r in rows:
+                        if r["short"]:
+                            fp.write("#%-5d %s-%s  %.2fs  %s\n"
+                                     % (r["n"], fmt_timecode(r["t0"]),
+                                        fmt_timecode(r["t1"]), r["t1"] - r["t0"],
+                                        r["text"][:40]))
             except Exception as exc:
                 self.log("⚠️ 复核报告写入失败: %s" % exc)
             self.log("🔍 复核结束: 共 %d 条,可疑 %d 条(对话框 %d / 选项 %d),报告 %s"
@@ -1323,6 +1389,14 @@ class App:
                     self.log("🧹 删掉 %d 条空行,原文件备份为 %s.bak" % (len(drop), srt_path))
                 except Exception as exc:
                     self.log("⚠️ 删除失败(原文件没动): %s" % exc)
+            self.root.after(0, lambda: self._set_check_progress(100))
+            self.log("✅ 复核完成(报告 %s)" % report_path)
+            self.root.after(0, lambda n=len(rows), d=len(dead), dd=len(dead_dialog),
+                            dc=len(dead_choice), rp=report_path:
+                            messagebox.showinfo(
+                                "复核完成",
+                                "共 %d 条,可疑 %d 条(对话框 %d / 选项 %d)\n报告:\n%s"
+                                % (n, d, dd, dc, rp)))
         except Exception as exc:
             self.log("❌ 复核出错: %s" % exc)
             self.log(traceback.format_exc())
@@ -1598,6 +1672,8 @@ class App:
 
                 # ---------- 选项轨 ----------
                 xc, yc, wc, hc = rect_c
+                if not cfg.get("use_choice_track", True):
+                    xc = yc = wc = hc = 0          # 关掉选项轨:整段跳过
                 c_info = None
                 roi_c = None
                 anchor = None
@@ -1606,7 +1682,10 @@ class App:
                     roi_c = frame[yc:yc + hc, xc:xc + wc]
                     if require_anchor:
                         anchor = find_anchor(frame, rect_c, content, cfg)
-                    if use_structure:
+                    # 选项轨一律用结构判据,不跟着"判定"下拉框走。
+                    # V17 把它跟着改成"墨水判定"之后,选项段在花花绿绿的背景上
+                    # 永远关不掉 —— 实测出现过 97 秒、60 秒这种假选项段。
+                    if use_structure or cfg.get("choice_use_structure", True):
                         c_info = analyze_text_auto(roi_c, dark_on_light, thr,
                                                    content_h, cfg, c_mask_prev)
                     else:
@@ -1643,7 +1722,15 @@ class App:
                             c_tries = 0
                             c_anchor_seen = anchor is not None
                     else:
-                        if is_choice:
+                        # "选项还在" = 框里有文字行 且 圆钮还在;超过保险丝时长也算它消失
+                        visible = (is_choice
+                                   and (not require_anchor or anchor is not None))
+                        if (idx - c_start) / fps > cfg["choice_max_seconds"]:
+                            visible = False
+                            if verbose and idx % 60 == 0:
+                                self.log("   ✂ 选项段超过 %.0f 秒,强制结算"
+                                         % cfg["choice_max_seconds"])
+                        if visible:
                             c_empty = 0
                             if density_c > c_best_density:
                                 c_best_density = density_c
@@ -1745,7 +1832,8 @@ class App:
                 idx += 1
 
             # ---- 对话轨 OCR 补救:扫描结束后再补救那些读不出文字的句子 ----
-            if do_ocr and retry_list and self.is_processing:
+            if (do_ocr and retry_list and cfg.get("retry_ocr_frames", 0) > 0
+                    and self.is_processing):
                 self.log("🔁 OCR 补救: %d 句要重试" % len(retry_list))
                 fixed = 0
                 tries = (0.5, 0.75, 0.9, 0.3)[:max(1, int(cfg["retry_ocr_frames"]))]
