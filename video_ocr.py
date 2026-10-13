@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V22
+V23
+
+V22 -> V23 的改动:
+  1. 【快】find_anchor 里的"局部背景亮度"从 165x165 高斯换成方框模糊:
+     高斯哪怕分离实现也要几十毫秒,方框模糊走积分图每像素 O(1)。
+     这是流水线里最贵的一笔(V22 实测约 3.7 倍慢主要就是它),判定逻辑不变;
+  2. 时间戳本来就有了,这里说明一下位置:开始是日志第一行
+     `🚀 === Vxx 开始提取 2026-10-13 12:19:03 ===`,写完 SRT 会打一行
+     `💾 已写入: ... (共 N 条, 耗时 X 分钟)`。
 
 V21 -> V22 的改动(详见 README.md):
   1. 【修】圆钮判定条件原来是反的:旧代码写 fill>=0.55(只收实心暗块),而真圆钮是
@@ -211,10 +219,13 @@ DEFAULT_CONFIG = {
     "anchor_tpl_min": 0.60,
     "require_anchor_in_white_mode": False,
     "detect_mode": "bubble",
-    "bubble_ratio_min": 0.40,
+    # 实测:室外选项条 浅色占比 0.86、室内选项条 0.93(但 V 跨度 59~82,带渐变),
+    # 而室内背景(墙+地板)只有 0.34。所以:占比门槛提到 0.55,平整度放到 90 ——
+    # 这样室内那种"稍微带渐变"的条子能过,背景依旧过不了。
+    "bubble_ratio_min": 0.55,
     "bubble_sat_max": 100,
     "bubble_v_min": 120,
-    "bubble_spread_max": 55,
+    "bubble_spread_max": 90,
     "anchor_every": 3,
     "review_mode": "report",
     "ocr_crop_to_text": True,
@@ -620,7 +631,9 @@ def find_anchor(frame, rect_px, content, cfg):
     sub = frame[sy0:sy1, sx0:sx1]
     gray = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
     ksize = max(5, int(round(sub.shape[0] * 0.55)) | 1)
-    bg = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+    # 这里只需要"局部背景亮度",用不着高斯:方框模糊走积分图,每像素 O(1),
+    # 而 165x165 的高斯哪怕分离实现也要几十毫秒 —— 这是流水线里最贵的一笔。
+    bg = cv2.blur(gray, (ksize, ksize))
     dark = ((bg.astype(np.int16) - gray.astype(np.int16)) > 30).astype(np.uint8) * 255
     try:
         count, _labels, stats, _cents = cv2.connectedComponentsWithStats(dark, 8)
@@ -1584,7 +1597,8 @@ class App:
         self.btn_run.config(state=tk.DISABLED, text="处理中...")
         self.btn_stop.config(state=tk.NORMAL)
         self.log("")
-        self.log("🚀 === %s 开始提取 ===" % APP_VERSION)
+        self.log("🚀 === %s 开始提取  %s ===" % (APP_VERSION,
+                                                 time.strftime("%Y-%m-%d %H:%M:%S")))
         threading.Thread(target=self.run_process, daemon=True).start()
 
     # ---------------- 以下为主流程与复核 ----------------
@@ -2096,7 +2110,8 @@ class App:
             srt_path = base + ("_OCR.srt" if do_ocr else ".srt")
             with open(srt_path, "w", encoding="utf-8-sig") as fp:
                 fp.write(srt.compose(subs))
-            self.log("💾 已写入: %s（共 %d 条）" % (srt_path, len(subs)))
+            self.log("💾 已写入: %s（共 %d 条, 耗时 %.1f 分钟）"
+                     % (srt_path, len(subs), (time.time() - t_start) / 60.0))
 
             if review_mode == "off":
                 self.log("ℹ️ 复核已关闭")
