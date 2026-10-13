@@ -1,7 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V21
+V22
+
+V21 -> V22 的改动(详见 README.md):
+  1. 【修】圆钮判定条件原来是反的:旧代码写 fill>=0.55(只收实心暗块),而真圆钮是
+     "空心环"(实测 fill=0.12~0.13) —— 于是专挑立绘的帽子/头发、专排真圆钮。
+     这是从引入 find_anchor 起就有的 bug,由你看出来的。现在改成:
+     fill 0.08~0.45、aspect 0.85~1.20、尺寸占画面高 6.5%~13%(实测 82px/884=9.3%);
+  2. 【新】模板匹配:程序读 exe 旁边的 anchor_template.png(圆钮截图),按"内容区高度的
+     9.4%"缩放后在框左边找最像的位置,分数低于 0.60 不认。圆钮尺寸跟着画面高度走,
+     所以换分辨率也能用;没有这个文件就自动退回形状判据;
+  3. 【修】选项的备用帧不再按"墨水最多"挑:选项被按下时整个框会膨胀一下,那一帧字最大、
+     墨水也最多,但它是放大的乱画面,OCR 读出来不是日文。现在固定用"第一次通过判定的帧"。
+  注意:anchor_template.png 要和 exe 放在同一个文件夹里。
 
 V20 -> V21 的改动(只动性能,判定逻辑一个字没改):
   1. 【快】圆钮检测降频:改成每 3 帧找一次(find_anchor 要在大片区域上做高斯模糊 +
@@ -186,11 +198,17 @@ DEFAULT_CONFIG = {
     "try_opposite_polarity": True,
     "anchor_search_left": 1.2,
     "anchor_search_updown": 0.9,
-    "anchor_aspect_min": 0.65,
-    "anchor_aspect_max": 1.55,
-    "anchor_fill_min": 0.55,
-    "anchor_h_min_ratio": 0.035,
-    "anchor_h_max_ratio": 0.20,
+    # 圆钮实测(实拍帧 1914x884):82x82、fill=0.12~0.13、aspect=1.00、约占画面高 9.3%。
+    # 旧版这里写的是 fill>=0.55 —— 只收实心暗块,把"空心环"的真圆钮全部排除,
+    # 于是专挑立绘帽子/头发那种 fill=0.9 的块。这是从引入起就存在的真 bug。
+    "anchor_aspect_min": 0.85,
+    "anchor_aspect_max": 1.20,
+    "anchor_fill_min": 0.08,
+    "anchor_fill_max": 0.45,
+    "anchor_h_min_ratio": 0.065,
+    "anchor_h_max_ratio": 0.130,
+    "anchor_h_ratio": 0.094,
+    "anchor_tpl_min": 0.60,
     "require_anchor_in_white_mode": False,
     "detect_mode": "bubble",
     "bubble_ratio_min": 0.40,
@@ -617,7 +635,8 @@ def find_anchor(frame, rect_px, content, cfg):
         aspect = bw / float(bh)
         if aspect < cfg["anchor_aspect_min"] or aspect > cfg["anchor_aspect_max"]:
             continue
-        if area / float(bw * bh) < cfg["anchor_fill_min"]:
+        fill = area / float(bw * bh)
+        if fill < cfg["anchor_fill_min"] or fill > cfg["anchor_fill_max"]:
             continue
         gx, gy = sx0 + bx, sy0 + by
         if gx + bw < x - w * 0.4:
@@ -627,6 +646,59 @@ def find_anchor(frame, rect_px, content, cfg):
         if best is None or area > best[0]:
             best = (area, (gx, gy, bw, bh))
     return None if best is None else best[1]
+
+
+def load_anchor_template():
+    """读 exe 旁边的 anchor_template.png(圆钮小截图)。没有就返回 None,自动退回形状判据。"""
+    try:
+        path = os.path.join(app_dir(), "anchor_template.png")
+        if not os.path.exists(path):
+            return None
+        buf = np.fromfile(path, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None or img.size == 0:
+            return None
+        return img
+    except Exception:
+        return None
+
+
+def find_anchor_tpl(frame, rect_px, content, cfg, tpl):
+    """用模板匹配找圆钮 —— 比手写形状规则可靠得多。
+
+    模板按"内容区高度的 9.4%"缩放(圆钮尺寸跟着画面高度走,所以换分辨率也能用),
+    再上下浮动两档,在框左边那块区域里取相似度最高的位置。
+    返回 (位置, 最高分);分数不到 anchor_tpl_min 就不认。
+    """
+    try:
+        cx0, cy0, cw, chh = content
+        x, y, w, h = rect_px
+        sx0 = int(max(cx0, x - cfg["anchor_search_left"] * w))
+        sx1 = int(min(cx0 + cw, x + w * 0.5))
+        sy0 = int(max(cy0, y - cfg["anchor_search_updown"] * h))
+        sy1 = int(min(cy0 + chh, y + h + cfg["anchor_search_updown"] * h))
+        if sx1 - sx0 < 40 or sy1 - sy0 < 40:
+            return None, 0.0
+        sub = frame[sy0:sy1, sx0:sx1]
+        th, tw = tpl.shape[:2]
+        want = max(8.0, chh * float(cfg.get("anchor_h_ratio", 0.094)))
+        best, best_score = None, 0.0
+        for scale in (want / th, want / th * 1.15, want / th * 0.87):
+            nw, nh = max(8, int(tw * scale)), max(8, int(th * scale))
+            if nh >= sub.shape[0] or nw >= sub.shape[1]:
+                continue
+            t = cv2.resize(tpl, (nw, nh),
+                           interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+            res = cv2.matchTemplate(sub, t, cv2.TM_CCOEFF_NORMED)
+            _mn, mx, _ml, ml = cv2.minMaxLoc(res)
+            if float(mx) > best_score:
+                best_score = float(mx)
+                best = (sx0 + int(ml[0]), sy0 + int(ml[1]), nw, nh)
+        if best is None or best_score < float(cfg.get("anchor_tpl_min", 0.60)):
+            return None, best_score
+        return best, best_score
+    except Exception:
+        return None, 0.0
 
 
 def detect_content_area(frames, width, height):
@@ -999,6 +1071,13 @@ class App:
             entry.bind("<Return>", lambda _e, k=key, i=idx: self.on_rect_entry(k, i))
             entry.pack(side=tk.LEFT)
             self.rect_ui[key].append((scale, entry))
+        if key == "c":
+            # 判定选项时要用左边那个 ▶ 圆钮:模板匹配也好、形状判据也好,
+            # 都得能在那块区域里找到它。所以这里明确提示一句。
+            tk.Label(frame,
+                     text="⚠️ 请把左边的 ▶ 箭头按钮也框进蓝框(判定要用它;框宽一点没关系)",
+                     fg="#c00000", font=("微软雅黑", 9)).pack(anchor="w", padx=4,
+                                                              pady=(3, 0))
 
     # ---------------- 区域 / 预览 ----------------
     def on_rect(self, value, idx, key):
@@ -1530,6 +1609,10 @@ class App:
             verbose = bool(self.var_verbose.get())
             require_anchor = dark_on_light or bool(cfg["require_anchor_in_white_mode"])
             use_choice_track = bool(self.var_choice.get())
+            c_anchor_tpl = load_anchor_template()
+            self.log("ℹ️ 圆钮: %s" % ("模板匹配(已载入 anchor_template.png)"
+                                     if c_anchor_tpl is not None
+                                     else "形状判据(没找到 anchor_template.png)"))
             drop_unreadable_choice = bool(cfg.get("drop_unreadable_choice", True))
 
             cap = cv2.VideoCapture(self.video_path)
@@ -1634,6 +1717,7 @@ class App:
             c_mask_prev = None
             c_anchor_seen = False
             c_anchor_cache = None
+            c_last_bubble_ok = False
 
             anchor_every = max(1, int(cfg.get("anchor_every", 3)))
             t_start = time.time()
@@ -1787,10 +1871,20 @@ class App:
                         and xc + wc <= frame.shape[1]):
                     roi_c = frame[yc:yc + hc, xc:xc + wc]
                     if require_anchor:
-                        # 圆钮是静止的,不用每帧都找(这一步很贵):每 anchor_every 帧一次,
-                        # 中间帧沿用上次结果 —— 实测能省掉三分之二的时间
+                        # 圆钮是静止的,不用每帧都找:每 anchor_every 帧一次,中间帧沿用上次结果。
+                        # 有模板时只在"上一帧泡泡判定通过"的帧才去匹配(匹配偏贵),
+                        # 平时根本不会走到这里。
                         if c_anchor_cache is None or idx % anchor_every == 0:
-                            c_anchor_cache = find_anchor(frame, rect_c, content, cfg)
+                            if (c_anchor_tpl is None or c_last_bubble_ok
+                                    or c_anchor_cache is None):
+                                if c_anchor_tpl is not None:
+                                    c_anchor_cache, tpl_score = find_anchor_tpl(
+                                        frame, rect_c, content, cfg, c_anchor_tpl)
+                                    if verbose and tpl_score and idx % 600 == 0:
+                                        self.log("   🔍 模板匹配最高分 %.2f" % tpl_score)
+                                else:
+                                    c_anchor_cache = find_anchor(frame, rect_c, content,
+                                                                 cfg)
                         anchor = c_anchor_cache
                     # 选项轨一律用结构判据,不跟着"判定"下拉框走。
                     # V17 把它跟着改成"墨水判定"之后,选项段在花花绿绿的背景上
@@ -1806,6 +1900,7 @@ class App:
                                                 c_mask_prev)
                     if c_info is not None:
                         c_mask_prev = c_info["mask"].copy()
+                        c_last_bubble_ok = bool(c_info["ok"])
                     if anchor is not None:
                         c_anchor_seen = True
 
@@ -1855,12 +1950,10 @@ class App:
                                          % cfg["choice_max_seconds"])
                         if visible:
                             c_empty = 0
-                            if density_c > c_best_density:
-                                c_best_density = density_c
-                                c_glyph_max = max(c_glyph_max, c_info["nglyph"])
-                                if not c_locked:
-                                    c_fallback_roi = roi_c.copy()
-                                    c_fallback_info = c_info
+                            c_glyph_max = max(c_glyph_max, c_info["nglyph"])
+                            # 备用帧固定用"第一次通过判定的那一帧"(激活时记下的),
+                            # 不再按墨水最多去换 —— 按下选项时框会膨胀,那一帧字最大、
+                            # 墨水最多,但 OCR 读出来不是日文。
                             if not c_locked:
                                 if diff_c < cfg["still_diff"]:
                                     c_still += 1
