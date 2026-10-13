@@ -220,6 +220,11 @@ DEFAULT_CONFIG = {
     "anchor_tpl_min": 0.75,
     "row_min_glyphs": 2,
     "row_span_lenient": 0.08,
+    # V25:下面两条默认都关。V24 把它们全打开,结果又慢又扫不出东西(选项几乎全丢)。
+    # "需要字形行"治白色毛领/云/石板路那类误报很有效,但慢一些、单字行会漏;
+    # 界面上有开关,想要就勾上。
+    "require_text_row": False,
+    "ink_max_ratio": 0.60,
     "require_anchor_in_white_mode": False,
     "detect_mode": "bubble",
     # 实测:室外选项条 浅色占比 0.86、室内选项条 0.93(但 V 跨度 59~82,带渐变),
@@ -634,7 +639,17 @@ def bubble_density(roi, dark_on_light, thr, content_h, cfg, prev_mask=None):
     info["bubble_ratio"] = ratio
     info["bubble_spread"] = spread
     # 只有"看起来像泡泡"的帧才值得去数字形(这一步比较贵),所以放在最后
-    info["ok"] = bool(flat and text_row_ok(roi, dark_on_light, thr, content_h, cfg))
+    # 墨水太多(整块全暗,实测见过 0.95)的帧不是泡泡,后面全跳过
+    if info["ink_density"] > float(cfg.get("ink_max_ratio", 0.60)):
+        info["ok"] = False
+        return info
+    if not flat:
+        info["ok"] = False
+        return info
+    if cfg.get("require_text_row", False):
+        info["ok"] = text_row_ok(roi, dark_on_light, thr, content_h, cfg)
+    else:
+        info["ok"] = True
     return info
 
 
@@ -717,7 +732,9 @@ def find_anchor_tpl(frame, rect_px, content, cfg, tpl):
         th, tw = tpl.shape[:2]
         want = max(8.0, chh * float(cfg.get("anchor_h_ratio", 0.094)))
         best, best_score = None, 0.0
-        for scale in (want / th, want / th * 1.15, want / th * 0.87):
+        # 缩放档位放宽到 0.55~1.7 倍:模板来自哪个分辨率的截图都能配上,
+        # 以后换素材不用再手动换模板文件。
+        for scale in (want / th * f for f in (0.55, 0.7, 0.85, 1.0, 1.2, 1.45, 1.7)):
             nw, nh = max(8, int(tw * scale)), max(8, int(th * scale))
             if nh >= sub.shape[0] or nw >= sub.shape[1]:
                 continue
@@ -1017,6 +1034,9 @@ class App:
                        font=("微软雅黑", 10, "bold"), fg="#a0522d"
                        ).pack(side=tk.LEFT, padx=(14, 0))
 
+        self.var_row = tk.BooleanVar(value=bool(self.cfg.get("require_text_row", False)))
+        tk.Checkbutton(f_top2, text="需要字形行(治毛领/地面)",
+                       variable=self.var_row).pack(side=tk.LEFT, padx=(14, 0))
         self.var_verbose = tk.BooleanVar(value=True)
         tk.Checkbutton(f_top2, text="诊断日志", variable=self.var_verbose).pack(side=tk.LEFT)
 
@@ -1647,6 +1667,7 @@ class App:
             require_anchor = dark_on_light or bool(cfg["require_anchor_in_white_mode"])
             use_choice_track = bool(self.var_choice.get())
             c_anchor_tpl = load_anchor_template()
+            cfg["require_text_row"] = bool(self.var_row.get())
             self.log("ℹ️ 圆钮: %s" % ("模板匹配(已载入 anchor_template.png)"
                                      if c_anchor_tpl is not None
                                      else "形状判据(没找到 anchor_template.png)"))
@@ -1917,6 +1938,13 @@ class App:
                                 if c_anchor_tpl is not None:
                                     c_anchor_cache, tpl_score = find_anchor_tpl(
                                         frame, rect_c, content, cfg, c_anchor_tpl)
+                                    if c_anchor_cache is None:
+                                        # 模板在这个素材上没配上(你的 1280x720 那版最高才 0.39),
+                                        # 这时退回"形状判据"(V22 修好的 fill 0.08~0.45 那套)。
+                                        # 注意:V22~V24 里这条回退是死的 —— 因为模板文件总是存在,
+                                        # 修好的形状判据从来没被用到过。
+                                        c_anchor_cache = find_anchor(frame, rect_c, content,
+                                                                     cfg)
                                     if verbose and tpl_score and idx % 600 == 0:
                                         self.log("   🔍 模板匹配最高分 %.2f" % tpl_score)
                                 else:
