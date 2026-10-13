@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/33368633/README.md)
+[README.md](https://github.com/user-attachments/files/33380298/README.md)
 # Video Subtitle Extractor V16
 
 TWST / 18T 打轴 & Windows 自带 OCR 辨识。
