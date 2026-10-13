@@ -186,7 +186,8 @@ DEFAULT_CONFIG = {
     "check_min_glyphs": 2,
     "check_span_ratio": 0.08,
     "check_ocr_frames": 4,
-    "check_min_seconds": 0.6,
+    "check_min_seconds": 0.5,
+    "check_kill_short": True,
     "still_diff": 0.001,
     "choice_start_density": 0.004,
     "min_glyphs": 3,
@@ -216,7 +217,9 @@ DEFAULT_CONFIG = {
     "anchor_h_min_ratio": 0.065,
     "anchor_h_max_ratio": 0.130,
     "anchor_h_ratio": 0.094,
-    "anchor_tpl_min": 0.60,
+    "anchor_tpl_min": 0.75,
+    "row_min_glyphs": 2,
+    "row_span_lenient": 0.08,
     "require_anchor_in_white_mode": False,
     "detect_mode": "bubble",
     # 实测:室外选项条 浅色占比 0.86、室内选项条 0.93(但 V 跨度 59~82,带渐变),
@@ -601,8 +604,25 @@ def bubble_stats(roi, cfg):
         return 0.0, 999.0, False
 
 
-def bubble_density(roi, dark_on_light, thr, cfg, prev_mask=None):
-    """泡泡判定:框里得是一大片平整的浅色泡泡,而且里面有墨水。"""
+def text_row_ok(roi, dark_on_light, thr, content_h, cfg):
+    """宽松版"这一片浅色底下到底有没有一行字":2 个字形就算。
+
+    V24 起这是两个轨道共同的硬条件 —— 白色毛领、云、石板路面、地板、标题卡
+    (白字黑底)都是"平整的浅色一片",但它们**凑不出字形**,这一条全部挡住。
+    代价:单个字的行会漏(凑不出 2 个字形),已确认可以接受。
+    """
+    try:
+        c = dict(cfg)
+        c["min_glyphs"] = max(1, int(cfg.get("row_min_glyphs", 2)))
+        c["row_span_min_ratio"] = float(cfg.get("row_span_lenient", 0.08))
+        info = analyze_text(roi, dark_on_light, thr, content_h, c, None)
+        return bool(info and info.get("ok"))
+    except Exception:
+        return False
+
+
+def bubble_density(roi, dark_on_light, thr, content_h, cfg, prev_mask=None):
+    """泡泡判定:框里得是一大片平整的浅色泡泡 + 有墨水 + 底下真有一行字。"""
     info = legacy_density(roi, dark_on_light, thr, cfg, prev_mask)
     # 先看墨水:没墨水的帧(绝大多数)直接跳过后面那笔昂贵计算
     if info["ink_density"] < cfg["text_start_density"]:
@@ -613,7 +633,8 @@ def bubble_density(roi, dark_on_light, thr, cfg, prev_mask=None):
     ratio, spread, flat = bubble_stats(roi, cfg)
     info["bubble_ratio"] = ratio
     info["bubble_spread"] = spread
-    info["ok"] = bool(flat)
+    # 只有"看起来像泡泡"的帧才值得去数字形(这一步比较贵),所以放在最后
+    info["ok"] = bool(flat and text_row_ok(roi, dark_on_light, thr, content_h, cfg))
     return info
 
 
@@ -1486,8 +1507,10 @@ class App:
                 rows.append({"n": i + 1, "t0": t0, "t1": t1, "text": text,
                              "choice": "[Choice]" in text,
                              "short": too_short,
-                             # 太短的行证据不足,一律不删(宁可留给你手看)
-                             "alive": (hit > 0) or bool(ocr_text) or too_short,
+                             # 实测最短的真行是 0.75 秒(只有音效),所以 <0.5 秒基本是误判
+                             "alive": (((hit > 0) or bool(ocr_text))
+                                       and not (too_short
+                                                and cfg.get("check_kill_short", True))),
                              "hit": hit, "tried": tried, "ocr": ocr_text, "shot": shot})
             dead = [r for r in rows if not r["alive"]]
             dead_dialog = [r for r in dead if not r["choice"]]
@@ -1760,8 +1783,8 @@ class App:
                         and x + w <= frame.shape[1]):
                     roi_d = frame[y:y + h, x:x + w]
                     if use_bubble:
-                        d_info = bubble_density(roi_d, dark_on_light, thr, cfg,
-                                                d_mask_prev)
+                        d_info = bubble_density(roi_d, dark_on_light, thr, content_h,
+                                                cfg, d_mask_prev)
                     elif use_structure:
                         d_info = analyze_text_auto(roi_d, dark_on_light, thr,
                                                    content_h, cfg, d_mask_prev)
@@ -1904,8 +1927,8 @@ class App:
                     # V17 把它跟着改成"墨水判定"之后,选项段在花花绿绿的背景上
                     # 永远关不掉 —— 实测出现过 97 秒、60 秒这种假选项段。
                     if use_bubble:
-                        c_info = bubble_density(roi_c, dark_on_light, thr, cfg,
-                                                c_mask_prev)
+                        c_info = bubble_density(roi_c, dark_on_light, thr, content_h,
+                                                cfg, c_mask_prev)
                     elif use_structure or cfg.get("choice_use_structure", True):
                         c_info = analyze_text_auto(roi_c, dark_on_light, thr,
                                                    content_h, cfg, c_mask_prev)
@@ -1928,9 +1951,8 @@ class App:
                         is_choice = (bool(c_info["ok"])
                                      and density_c >= cfg["choice_start_density"])
                         if is_choice and anchor is None:
-                            text_row = analyze_text_auto(roi_c, dark_on_light, thr,
-                                                         content_h, cfg, None)
-                            is_choice = bool(text_row and text_row["ok"])
+                            is_choice = text_row_ok(roi_c, dark_on_light, thr,
+                                                    content_h, cfg)
                     else:
                         is_choice = (bool(c_info["ok"]) and anchor_ok
                                      and density_c >= cfg["choice_start_density"])
