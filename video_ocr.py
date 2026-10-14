@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V28
+V29
+
+V28 -> V29 的改动(修 V28 自己捅出来的性能坑):
+  1. 【快】圆钮查找严格按 anchor_every(默认 3 帧)降频 —— V28 那版只要"还没找到圆钮"
+     就每帧重跑一遍(2 张模板 × 10 档 = 20 次 matchTemplate),整片没有圆钮的片子会慢
+     8 倍以上,实测就是这样把 CH4 拖垮的;
+  2. 【修】"放弃"的门槛从"最高分 < 阈值的 70%"改成"最高分从没到过阈值"。
+     旧门槛的问题:新模板在普通对话框上能拿 0.5~0.7 分,刚好卡在放弃线(0.525)之上、
+     合格线(0.75)之下 → 永远不放弃 → 永远每帧重跑;
+  3. 【保】放弃之后不是彻底不管:每 0.5 秒抽查一次(选项画面会停留好几秒,够抓到),
+     抽查中了就恢复全速;日志都会写清楚。
 
 V27 -> V28 的改动(圆钮/选项轨重做,治 CH4 那种"满屏假选项"):
   1. 【修】圆钮模板可以放多张:exe 旁边的 anchor_template*.png 全部读进来,逐张试、
@@ -2039,13 +2049,19 @@ class App:
                         # 圆钮是静止的,不用每帧都找:每 anchor_every 帧一次,中间帧沿用上次结果。
                         # 有模板时只在"上一帧泡泡判定通过"的帧才去匹配(匹配偏贵),
                         # 平时根本不会走到这里。
-                        if c_anchor_cache is None or idx % anchor_every == 0:
+                        # V29:圆钮查找严格按 anchor_every 降频 —— 不再因为"缓存是空的"就每帧重跑。
+                        # (V28 那版只要没找到就每帧试一遍 2 模板 × 10 档,遇到"整片没圆钮"的
+                        #  片子会慢 8 倍以上,是最要命的性能坑。)
+                        if idx % anchor_every == 0:
                             if (not c_anchor_tpls or c_last_bubble_ok
                                     or c_anchor_cache is None):
-                                # V26:所有模板都被判定"配不上本素材"之后,只在每 3000 帧白试一次;
-                                # 平时直接走形状判据 —— 省掉每帧十几档的模板比对。
+                                # 全部模板都"从没到过阈值"之后降频到每 0.5 秒试一次:
+                                # 既不拖速度,又不至于漏掉"整片只有一两个选项"的片子
+                                # (选项画面一般会停留好几秒)。
+                                probe_every = max(anchor_every, int(round(fps * 0.5)))
                                 use_tpl = (bool(c_anchor_tpls)
-                                           and (not c_tpl_off or idx % 3000 == 0))
+                                           and (not c_tpl_off
+                                                or idx % probe_every == 0))
                                 if use_tpl:
                                     c_anchor_cache, tpl_score, tpl_name = find_anchor_tpl(
                                         frame, rect_c, content, cfg, c_anchor_tpls)
@@ -2057,14 +2073,22 @@ class App:
                                         if (not c_tpl_off
                                                 and c_tpl_tries >= int(cfg.get(
                                                     "tpl_give_up_tries", 12))
-                                                and c_tpl_best < tpl_min * float(cfg.get(
-                                                    "tpl_give_up_ratio", 0.70))):
+                                                and c_tpl_best < tpl_min):
+                                            # V29:放弃线改成"最好的一次都没到过阈值"。
+                                            # V28 写的是"低于阈值的 70%",结果新模板在普通对话框上
+                                            # 能拿 0.5~0.7 分 —— 卡在线上、永远不放弃,每帧重跑 20 次
+                                            # 匹配,慢得离谱。
                                             c_tpl_off = True
-                                            self.log("🔍 %d 张圆钮模板都配不上本素材(最高分"
-                                                     " %.2f,阈值 %.2f) → 本片按'没有选项'处理,"
-                                                     "不再产出选项行"
+                                            self.log("🔍 %d 张圆钮模板目前都配不上本素材(最高分"
+                                                     " %.2f,阈值 %.2f) → 本片先按'没有选项'跑,"
+                                                     "之后每 %.1f 秒抽查一次,冒出真选项照样抓得到"
                                                      % (len(c_anchor_tpls), c_tpl_best,
-                                                        tpl_min))
+                                                        tpl_min,
+                                                        probe_every / float(fps)))
+                                        elif c_tpl_off and tpl_score >= tpl_min:
+                                            c_tpl_off = False      # 抽查时中了,恢复全速查找
+                                            self.log("🔍 圆钮模板又配上了(%.2f,%s),恢复查找"
+                                                     % (tpl_score, tpl_name))
                                     if c_anchor_cache is None and not cfg.get(
                                             "choice_require_tpl_anchor", True):
                                         # V28:默认不再用形状判据兜底 —— 实测它在花花绿绿的背景、
@@ -2076,8 +2100,13 @@ class App:
                                         self.log("   🔍 圆钮模板最高分 %.2f (%s)"
                                                  % (tpl_score, tpl_name))
                                 else:
-                                    c_anchor_cache = find_anchor(frame, rect_c, content,
-                                                                 cfg)
+                                    # V29:模板被降频/放弃之后,形状判据只在"一张模板都没有"
+                                    # 或 choice_require_tpl_anchor 关掉时才用 —— 否则假选项
+                                    # 会从这条路重新溜回来(它才是 CH4 那 18 条的元凶)。
+                                    if (not c_anchor_tpls or not cfg.get(
+                                            "choice_require_tpl_anchor", True)):
+                                        c_anchor_cache = find_anchor(frame, rect_c, content,
+                                                                     cfg)
                         anchor = c_anchor_cache
                     # 选项轨一律用结构判据,不跟着"判定"下拉框走。
                     # V17 把它跟着改成"墨水判定"之后,选项段在花花绿绿的背景上
