@@ -1,7 +1,33 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V23
+V27
+
+V26 -> V27 的改动(只加"换台词"判据,别的都没动):
+  1. 【修】同一个框里连续换台词时,不再并成一句。实测(参考 1181 条 vs 我们 1121 条):
+     58 处是"短句被长句吞掉" —— 反应声/音效/环境音(1.8~5.7 秒,如「ざわざわ……」、
+     「什么！？」「咔嚓！」)紧跟一句长台词,框一次都没空过、墨水只涨不跌,
+     老的三条断句规则(框空 5 帧 / 墨水掉到峰值 30% / 画面突变)一条都不触发,
+     于是整段被当成一句、只留"墨水最多那一帧"的 OCR = 长句,短句连时间一起被吞。
+  2. 新判据两条(对称),前提都是"上一句已经写完了":墨水静置 ≥12 帧(0.2 秒)不动,
+     把这个水位记成 d_hold;之后
+     - 墨水涨过 d_hold 的 1.5 倍(且至少 +0.0015)→ 新句开始打字 → 断开;
+     - 墨水掉到 d_hold 的 50% 以下(且至少 -0.0015)→ 旧字被清掉 → 断开。
+     打字过程中的正常增量(每帧几个百分点)不会误触发;万一短句逐字打字被拆成两段,
+     "开头 70% 一致就缝合"那条老规则会把碎片接回去。
+  3. 阈值是拿视频抽帧量出来的墨水曲线校验过的:
+     - 0:25:12「ざわざわ……」静置 5.3 秒后,一帧涨到 1.68 倍 → 触发 ✓
+     - 0:29:16 连续三句小字:0.0028→0.0082(2.9 倍)、0.0032→0.0087(2.7 倍)、
+       0.0087→0.0196(2.3 倍)→ 每句都能断开 ✓
+     - 0:41:50「(骚动……)」之后掉 55% → 触发 ✓
+
+V25 -> V26 的改动(只提速,判定一个字没改):
+  1. 【快】模板"自杀开关":一张模板在本素材上试够 12 次、最高分连阈值的 70% 都够不到,
+     就认定它配不上这支片子 —— 之后只在每 3000 帧白试一次(万一后面换场景能配上),
+     平时直接走形状判据。起因:1280x720 素材上那张 1914x884 的模板最高只有 0.39
+     (阈值 0.75),等于每 3 帧都在做一次注定失败的 7 档模板比对 —— 实测 47 帧/秒
+     (预计 2.5 小时),而 V23 走形状判据那会儿是 138 帧/秒(53 分钟)。
+     如果你本来就不想用模板:把 exe 旁边的 anchor_template.png 删掉就是同一条路(V25 起)。
 
 V22 -> V23 的改动:
   1. 【快】find_anchor 里的"局部背景亮度"从 165x165 高斯换成方框模糊:
@@ -166,6 +192,13 @@ DEFAULT_CONFIG = {
     "text_start_density": 0.004,
     "cut_peak_ratio": 0.30,
     "cut_abs_floor": 0.0015,
+    # V27:同一框里"换台词"的判据(详见文件头 V27 说明)。
+    # hold_* = "上一句写完了"时的墨水水位,以及允许的涨/跌幅度。
+    "hold_stable_frames": 12,
+    "hold_jump_ratio": 1.5,
+    "hold_jump_abs": 0.0015,
+    "hold_drop_ratio": 0.5,
+    "hold_drop_abs": 0.0015,
     "min_dur_dialog": 0.25,
     "miss_seconds_to_cut": 0.08,
     "motion_cut_after": 0.20,
@@ -218,6 +251,11 @@ DEFAULT_CONFIG = {
     "anchor_h_max_ratio": 0.130,
     "anchor_h_ratio": 0.094,
     "anchor_tpl_min": 0.75,
+    # V26:模板"自杀"阈值 —— 试够 tpl_give_up_tries 次、最高分不到阈值的 70%,
+    # 就停用模板匹配(之后每 3000 帧才白试一次)。只在"模板和素材明显不搭"时触发,
+    # 搭得上的素材永远不会走到这条。
+    "tpl_give_up_tries": 12,
+    "tpl_give_up_ratio": 0.70,
     "row_min_glyphs": 2,
     "row_span_lenient": 0.08,
     # V25:下面两条默认都关。V24 把它们全打开,结果又慢又扫不出东西(选项几乎全丢)。
@@ -927,7 +965,9 @@ class App:
     def __init__(self, root, cfg):
         self.cfg = cfg
         self.root = root
-        self.root.title("%s %s (%s)  结构判定版" % (APP_NAME, APP_VERSION, BUILD_DATE))
+        # V26:标题里原来硬写着"结构判定版" —— 那是早期版本默认判定的遗留标签,
+        # 跟界面上选的判定无关(容易看错,以为自己在跑结构判定)。现在只说版本和日期。
+        self.root.title("%s %s (%s)" % (APP_NAME, APP_VERSION, BUILD_DATE))
         self.root.geometry("1280x900")
 
         self.rect_pct = {
@@ -1755,6 +1795,7 @@ class App:
             d_mask_prev = None
             d_prev_density = 0.0
             d_stable = 99
+            d_hold = None            # V27:上一句写完时的墨水水位(换台词判据用)
 
             # 选项轨状态
             c_active = False
@@ -1776,9 +1817,15 @@ class App:
             c_anchor_seen = False
             c_anchor_cache = None
             c_last_bubble_ok = False
+            # V26:模板"自杀"用的三本账(每次运行重新计)
+            c_tpl_tries = 0
+            c_tpl_best = 0.0
+            c_tpl_off = False
 
             anchor_every = max(1, int(cfg.get("anchor_every", 3)))
+            tpl_min = float(cfg.get("anchor_tpl_min", 0.75))
             t_start = time.time()
+            t_mark, t_mark_idx = time.time(), 0        # V26:算"近段速度"用
             idx = 0
             while self.is_processing:
                 ok, frame = cap.read()
@@ -1789,12 +1836,20 @@ class App:
                     self.root.after(0, lambda v=prog: self.progress.config(value=v))
                 if verbose and total > 0 and idx > 0 and idx % 300 == 0:
                     # 挂机跑长片时,能看一眼"还要多久"很重要
-                    elapsed = max(0.001, time.time() - t_start)
+                    # V26:除了"全程平均",再报一个"近段"瞬时速度 —— 同一支片子里
+                    # 不同段落能差一倍(选项多、反复调 OCR 的段落会明显慢下来),
+                    # 只看全程平均的话,看不出来"现在到底快不快"。
+                    now = time.time()
+                    elapsed = max(0.001, now - t_start)
                     rate = idx / elapsed
+                    rate_now = ((idx - t_mark_idx) / (now - t_mark)
+                                if now - t_mark > 0.001 else rate)
+                    t_mark, t_mark_idx = now, idx
                     left = (total - idx) / rate if rate > 0 else 0.0
-                    self.log("⏱ %5.1f%%  %.0f 帧/秒  已跑 %.1f 分  预计剩余 %.1f 分"
-                             % (idx * 100.0 / total, rate, elapsed / 60.0,
-                                left / 60.0))
+                    self.log("⏱ %5.1f%%  平均 %.0f 帧/秒(近段 %.0f)  已跑 %.1f 分"
+                             "  预计剩余 %.1f 分"
+                             % (idx * 100.0 / total, rate, rate_now,
+                                elapsed / 60.0, left / 60.0))
 
                 # ---------- 对话轨 ----------
                 x, y, w, h = rect_d
@@ -1853,6 +1908,22 @@ class App:
                               and d_stable >= int(cfg["motion_cut_stable_frames"])
                               and (idx - d_start) / fps > cfg["motion_cut_after"]):
                             should_cut = True
+                        elif (d_hold is not None
+                              and density > d_hold * float(cfg["hold_jump_ratio"])
+                              and density - d_hold > float(cfg["hold_jump_abs"])):
+                            # V27:同一框里换台词 —— 上一句已经写完并静置(d_hold 就是它的
+                            # 水位),现在墨水猛涨过它一大截:那是新的一句在打字,不是同一句
+                            # 在继续(实测 0:25:12「ざわざわ……」→ 一帧涨到 1.68 倍)。
+                            should_cut = True
+                        elif (d_hold is not None
+                              and density < d_hold * (1.0 - float(cfg["hold_drop_ratio"]))
+                              and d_hold - density > float(cfg["hold_drop_abs"])):
+                            # 对称的另一半:写完的句子墨水猛掉 = 旧字被清掉、新句要开始
+                            # (管"长句→短句"那种;峰值 30% 那条管不到"新句也不小"的情况)。
+                            should_cut = True
+                        if should_cut:
+                            d_hold = None      # V27:这一句结算了,水位清零,等下一句写稳
+                            d_stable = 0       # 新句从"还没写稳"重新数,免得立刻又记水位
 
                         # 打字机效果会让墨水一路变多,那时候不是"换句",不能切。
                         # 连续若干帧墨水不再增长,才允许按"画面变化"切断。
@@ -1861,6 +1932,9 @@ class App:
                         else:
                             d_stable += 1
                         d_prev_density = density
+                        # V27:静置够久 = 这句写完了,把它的水位记下来当"换台词"的基准
+                        if d_stable >= int(cfg["hold_stable_frames"]):
+                            d_hold = density
 
                         if should_cut:
                             dur = (idx - d_start) / fps
@@ -1935,9 +2009,26 @@ class App:
                         if c_anchor_cache is None or idx % anchor_every == 0:
                             if (c_anchor_tpl is None or c_last_bubble_ok
                                     or c_anchor_cache is None):
-                                if c_anchor_tpl is not None:
+                                # V26:模板被判定"配不上本素材"之后,只在每 3000 帧白试一次;
+                                # 平时直接走形状判据 —— 省掉每帧 7 个缩放档的模板比对。
+                                use_tpl = (c_anchor_tpl is not None
+                                           and (not c_tpl_off or idx % 3000 == 0))
+                                if use_tpl:
                                     c_anchor_cache, tpl_score = find_anchor_tpl(
                                         frame, rect_c, content, cfg, c_anchor_tpl)
+                                    if tpl_score:
+                                        c_tpl_tries += 1
+                                        if tpl_score > c_tpl_best:
+                                            c_tpl_best = tpl_score
+                                        if (not c_tpl_off
+                                                and c_tpl_tries >= int(cfg.get(
+                                                    "tpl_give_up_tries", 12))
+                                                and c_tpl_best < tpl_min * float(cfg.get(
+                                                    "tpl_give_up_ratio", 0.70))):
+                                            c_tpl_off = True
+                                            self.log("🔍 模板配不上本素材(最高分 %.2f,阈值 %.2f)"
+                                                     " → 停用模板匹配,改用形状判据(速度回到 V23 那档)"
+                                                     % (c_tpl_best, tpl_min))
                                     if c_anchor_cache is None:
                                         # 模板在这个素材上没配上(你的 1280x720 那版最高才 0.39),
                                         # 这时退回"形状判据"(V22 修好的 fill 0.08~0.45 那套)。
