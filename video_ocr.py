@@ -1,7 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V29
+V31
+
+V30 -> V31 的改动(把圆钮匹配的"大档"砍掉 —— 这才是真凶):
+  1. 【快】缩放档从 10 档砍到 8 档,去掉了 1.70/2.00 这两个超大档。
+     原因:档位越大、模板越大,而 matchTemplate 的代价是"搜索区面积 × 模板面积"。
+     2.0 档会把模板放大到 ~180px,在几百像素见方的搜索区里单次就是几秒级的运算 ——
+     而且**配得上时也会照样把 10 档全算一遍**。CH4 那段"1 分钟跑 8 分钟"主要就是它。
+     另外加了一道保险:缩放后模板面积超过搜索区 15% 的档直接跳过。
+  2. 【快】圆钮缓存热了之后不再每 3 帧重找:改成每 0.15 秒确认一次(圆钮是静止的,
+     够用),冷启动(还没找到)时仍按 anchor_every 全速找。
+
+V29 -> V30 的改动(计时/日志 + 少跑一张模板):
+  1. 【便】日志加滚动条 + "保存日志"按钮 + 每次跑完自动存一份 <视频名>_run.log ——
+     以前日志刷得飞快又拉不回去,连"几点开始的"都看不到;
+  2. 【便】开始/结束/停止都写清时刻和总耗时:开始那行带日期时间,结束时再写一行
+     "⏱ 本次结束 HH:MM:SS,总共 X 分钟",日志旁边常驻小标签显示开始/结束时间,
+     点"停止"也会立刻写一行"开始于 … 已跑 … 分钟";
+  3. 【快】开跑前先"探测"哪张圆钮模板配得上这支片子(全片均匀取 9 帧,每张模板试一遍),
+     挑出分数最高且过阈值的那一张,**之后只用它** —— 匹配量直接减半,也免了"两张一起跑"。
+     探测分数会写进日志(例如 "anchor_template2.png 0.91 / anchor_template.png 0.38"),
+     一眼就能看出这支片子该用哪张。都不够阈值就保留全部,交给"配不上就自停用"兜底。
 
 V28 -> V29 的改动(修 V28 自己捅出来的性能坑):
   1. 【快】圆钮查找严格按 anchor_every(默认 3 帧)降频 —— V28 那版只要"还没找到圆钮"
@@ -807,14 +827,19 @@ def find_anchor_tpl(frame, rect_px, content, cfg, tpls):
         best, best_score, best_name = None, 0.0, ""
         # 档位 0.5~2.0(约每档 1.16 倍):老 UI 的圆钮占画面高 9.3%、新 UI 只占 7.6%,
         # 模板本身又是从别的截图裁的,所以宁可多试几档。多试的代价由"配不上就自停用"兜住。
+        # 模板面积上限:超过搜索区 15% 的档位直接跳过(那种比对的代价是平方级增长的,
+        # 而圆钮只占画面高 6~10%,根本用不到超大档)。
+        area_lim = sub.shape[0] * sub.shape[1] * 0.15
         for tname, tpl in tpls:
             th, tw = tpl.shape[:2]
             if th < 6 or tw < 6:
                 continue
-            for f in (0.50, 0.58, 0.68, 0.79, 0.92, 1.07, 1.25, 1.45, 1.70, 2.00):
+            for f in (0.50, 0.58, 0.68, 0.79, 0.92, 1.07, 1.25, 1.45):
                 scale = want / th * f
                 nw, nh = max(8, int(tw * scale)), max(8, int(th * scale))
                 if nh >= sub.shape[0] or nw >= sub.shape[1]:
+                    continue
+                if nw * nh > area_lim:
                     continue
                 t = cv2.resize(tpl, (nw, nh),
                                interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
@@ -1055,6 +1080,25 @@ class App:
             pass
         self.root.after(120, self._drain_log)
 
+    def save_log(self, path=None):
+        """V30:把日志框里的内容存成文件。不传 path 就自动存到视频旁边(<视频名>_run.log)。"""
+        try:
+            text = self.txt_log.get("1.0", tk.END)
+        except Exception:
+            return None
+        if path is None:
+            base = (os.path.splitext(self.video_path)[0]
+                    if getattr(self, "video_path", None) else "video_ocr")
+            path = base + "_run.log"
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write(text)
+            self.log("💾 日志已保存: %s" % path)
+            return path
+        except Exception as exc:
+            self.log("⚠️ 日志保存失败: %s" % exc)
+            return None
+
     def on_close(self):
         self.is_processing = False
         try:
@@ -1141,9 +1185,23 @@ class App:
         f_log = tk.Frame(f_mid)
         f_mid.add(f_log, width=380)
         tk.Label(f_log, text="📜 运行日志").pack(anchor="w")
-        self.txt_log = tk.Text(f_log, bg="#1e1e1e", fg="#00ff00",
+        # V30:日志要能拉回去看(以前刷得飞快,连"几点开始的"都抓不到),再加个保存按钮
+        f_logtxt = tk.Frame(f_log)
+        f_logtxt.pack(fill=tk.BOTH, expand=True)
+        sb_log = tk.Scrollbar(f_logtxt)
+        sb_log.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_log = tk.Text(f_logtxt, bg="#1e1e1e", fg="#00ff00",
                                font=("Consolas", 9), state=tk.DISABLED)
-        self.txt_log.pack(fill=tk.BOTH, expand=True)
+        self.txt_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb_log.config(command=self.txt_log.yview)
+        self.txt_log.config(yscrollcommand=sb_log.set)
+        f_logbar = tk.Frame(f_log)
+        f_logbar.pack(fill=tk.X, pady=(3, 0))
+        tk.Button(f_logbar, text="💾 保存日志", font=("微软雅黑", 9),
+                  command=self.save_log).pack(side=tk.LEFT)
+        self.lbl_timing = tk.Label(f_logbar, text="还没跑过", fg="#666",
+                                   font=("微软雅黑", 9))
+        self.lbl_timing.pack(side=tk.LEFT, padx=8)
 
         f_ctrl = tk.Frame(self.root, height=180)
         f_ctrl.pack(fill=tk.X, padx=10, pady=5)
@@ -1712,7 +1770,19 @@ class App:
 
     def stop_task(self):
         self.is_processing = False
-        self.log("⚠️ 收到停止指令，正在安全退出...")
+        # V30:停止时把"开始时刻 / 已跑多久"写清楚(以前日志刷过去就找不回来了)
+        t0 = getattr(self, "t_run0", None)
+        if t0:
+            mins = (time.time() - t0) / 60.0
+            self.log("⚠️ 收到停止指令，正在安全退出...（开始 %s，已跑 %.1f 分钟）"
+                     % (getattr(self, "t_start_str", "-"), mins))
+            try:
+                self.lbl_timing.config(text="停止于 %s（跑了 %.1f 分钟）"
+                                            % (time.strftime("%H:%M:%S"), mins))
+            except Exception:
+                pass
+        else:
+            self.log("⚠️ 收到停止指令，正在安全退出...")
 
     def start_task(self):
         if not self.video_path:
@@ -1721,8 +1791,13 @@ class App:
         self.btn_run.config(state=tk.DISABLED, text="处理中...")
         self.btn_stop.config(state=tk.NORMAL)
         self.log("")
-        self.log("🚀 === %s 开始提取  %s ===" % (APP_VERSION,
-                                                 time.strftime("%Y-%m-%d %H:%M:%S")))
+        self.t_run0 = time.time()
+        self.t_start_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.log("🚀 === %s 开始提取  %s ===" % (APP_VERSION, self.t_start_str))
+        try:
+            self.lbl_timing.config(text="开始 %s" % self.t_start_str[11:])
+        except Exception:
+            pass
         threading.Thread(target=self.run_process, daemon=True).start()
 
     # ---------------- 以下为主流程与复核 ----------------
@@ -1777,6 +1852,37 @@ class App:
             self.log("ℹ️ 对话框(像素) %s / 选项框(像素) %s" % (rect_d, rect_c))
             self.log("ℹ️ 判定=%s 阈值=%d 防连读=%.1f OCR=%s" % (
                 self.var_detect.get(), int(thr), self.s_diff.get(), "开" if do_ocr else "关"))
+            # V30:先探测哪张圆钮模板配得上这支片子,之后只用那一张。
+            # 你提的"按分辨率挑一张"方向是对的,但比按分辨率更靠谱的是直接拿画面试:
+            # 全片均匀取 9 帧,每张模板都试一遍,分数最高且过阈值的那张胜出。
+            # 都不够阈值就保留全部,后面交给"配不上就自停用"兜底。
+            if c_anchor_tpls and use_choice_track and total > 0:
+                try:
+                    hits = dict((nm, 0.0) for nm, _img in c_anchor_tpls)
+                    for k in range(1, 10):
+                        fr = grab_frame(cap, total * k / 10.0)
+                        if fr is None:
+                            continue
+                        for nm, img in c_anchor_tpls:
+                            _b, sc, _n = find_anchor_tpl(fr, rect_c, content, cfg,
+                                                         [(nm, img)])
+                            if sc > hits[nm]:
+                                hits[nm] = sc
+                    cap.release()
+                    cap = cv2.VideoCapture(self.video_path)
+                    ranked = sorted(hits.items(), key=lambda kv: -kv[1])
+                    score_txt = " / ".join("%s %.2f" % (n, s) for n, s in ranked)
+                    if ranked[0][1] >= float(cfg.get("anchor_tpl_min", 0.75)):
+                        keep_nm = ranked[0][0]
+                        c_anchor_tpls = [(n, i) for n, i in c_anchor_tpls
+                                         if n == keep_nm]
+                        self.log("🔍 圆钮模板探测: %s → 本片只用 %s"
+                                 % (score_txt, keep_nm))
+                    else:
+                        self.log("🔍 圆钮模板探测: %s → 都不够阈值,全部保留参与判定"
+                                 % score_txt)
+                except Exception as exc:
+                    self.log("⚠️ 圆钮模板探测失败(不影响继续跑): %s" % exc)
 
             def ocr_of(roi, info, fallback, prefer):
                 """给 OCR 的图,按 prefer 决定先试哪个。
@@ -2052,7 +2158,11 @@ class App:
                         # V29:圆钮查找严格按 anchor_every 降频 —— 不再因为"缓存是空的"就每帧重跑。
                         # (V28 那版只要没找到就每帧试一遍 2 模板 × 10 档,遇到"整片没圆钮"的
                         #  片子会慢 8 倍以上,是最要命的性能坑。)
-                        if idx % anchor_every == 0:
+                        # V31:缓存已经热了(圆钮找到了)就按"每 0.15 秒确认一次"来,
+                        # 不必每 3 帧重找 —— 圆钮是静止的。冷启动时仍按 anchor_every 全速找。
+                        warm_every = max(anchor_every, int(round(fps * 0.15)))
+                        if idx % (warm_every if c_anchor_cache is not None
+                                  else anchor_every) == 0:
                             if (not c_anchor_tpls or c_last_bubble_ok
                                     or c_anchor_cache is None):
                                 # 全部模板都"从没到过阈值"之后降频到每 0.5 秒试一次:
@@ -2325,6 +2435,10 @@ class App:
                 fp.write(srt.compose(subs))
             self.log("💾 已写入: %s（共 %d 条, 耗时 %.1f 分钟）"
                      % (srt_path, len(subs), (time.time() - t_start) / 60.0))
+            self.log("⏱ 本次:开始 %s → 结束 %s,总共 %.1f 分钟"
+                     % (getattr(self, "t_start_str", "-"),
+                        time.strftime("%Y-%m-%d %H:%M:%S"),
+                        (time.time() - t_start) / 60.0))
 
             if review_mode == "off":
                 self.log("ℹ️ 复核已关闭")
@@ -2340,6 +2454,13 @@ class App:
             self.log(traceback.format_exc())
         finally:
             self.is_processing = False
+            # V30:收尾写清时刻 + 自动存一份日志(<视频名>_run.log)
+            if getattr(self, "t_run0", None):
+                mins = (time.time() - self.t_run0) / 60.0
+                self.log("⏱ 任务收尾 %s,总共 %.1f 分钟" % (time.strftime("%H:%M:%S"), mins))
+                self.root.after(0, lambda m=mins: self.lbl_timing.config(
+                    text="结束 %s（共 %.1f 分钟）" % (time.strftime("%H:%M:%S"), m)))
+            self.root.after(900, lambda: self.save_log())
             self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL,
                                                            text="▶️ 开始处理"))
             self.root.after(0, lambda: self.btn_stop.config(state=tk.DISABLED))
