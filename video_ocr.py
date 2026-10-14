@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V31
+V32
+
+V31 -> V32 的改动(复核删得更干净 + 缝合不再被假选项挡住):
+  1. 【修】复核删"空行"再放宽一档:短行(<0.7 秒)只要读不出文字就删,不管它长得像不像
+     一行字 —— 程序自己的注释里就写着"实测最短的真行是 0.75 秒(只有音效)",所以比这更短
+     又读不出字的,基本是星尘/反光那类假行(P6 那种 0.5 秒的 Line 530 就是它)。
+     (删除仍然会先存 .bak,报告里也能看到删了哪些。)
+  2. 【修】缝合碎片时往回找"最近一条对话行",不再只看紧邻的上一条 ——
+     中间夹一条假选项行时,打字碎片会缝不回去、留下两行碎句。
+  3. 【调】缝合的"开头一致"门槛从 4 个字放宽到 3 个字(「当然!」这种 3 字碎片也能缝回)。
+  4. 【净】加载圆钮模板时跳过文件名带 zoom 的图(那是放大预览图,不是另一颗圆钮)。
 
 V30 -> V31 的改动(把圆钮匹配的"大档"砍掉 —— 这才是真凶):
   1. 【快】缩放档从 10 档砍到 8 档,去掉了 1.70/2.00 这两个超大档。
@@ -398,7 +408,7 @@ def write_image_unicode(path, img):
     return False
 
 
-def similar_prefix(a, b, ratio=0.7, min_chars=4):
+def similar_prefix(a, b, ratio=0.7, min_chars=3):
     """两句开头有多少字一样 —— 用来把"打字机效果"造成的碎句缝回去。
 
     例如「ひとりぼっちの主人公に」和「ひとりぼっちの主人公になんの意味があるのだ?」
@@ -793,6 +803,8 @@ def load_anchor_templates():
             low = name.lower()
             if not (low.startswith("anchor_template") and low.endswith(".png")):
                 continue
+            if "zoom" in low:
+                continue        # V32:带 zoom 的只是放大预览图,不是另一颗圆钮
             try:
                 buf = np.fromfile(os.path.join(app_dir(), name), dtype=np.uint8)
                 img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
@@ -1669,6 +1681,10 @@ class App:
                              # 实测最短的真行是 0.75 秒(只有音效),所以 <0.5 秒基本是误判
                              "alive": (((hit > 0) or bool(ocr_text))
                                        and not (too_short
+                                                and cfg.get("check_kill_short", True))
+                                       # V32:0.7 秒以内、又读不出文字的,直接算空行
+                                       # (程序自己的注释:实测最短的真行是 0.75 秒)
+                                       and not (not ocr_text and dur_line < 0.7
                                                 and cfg.get("check_kill_short", True))),
                              "hit": hit, "tried": tried, "ocr": ocr_text, "shot": shot})
             dead = [r for r in rows if not r["alive"]]
@@ -2102,7 +2118,13 @@ class App:
                                     # 等扫描结束后在它的时间范围内换几帧重试 OCR
                                     retry_list.append((rec, [x, y, w, h],
                                                        d_start / fps, idx / fps))
-                                prev = recs[-1] if recs else None
+                                # V32:往回找"最近一条对话行"(最多看 3 条)——
+                                # 中间夹着假选项行时,以前只认紧邻上一条,碎片就缝不回去。
+                                prev = None
+                                for _cand in reversed(recs[-3:]):
+                                    if _cand.kind == "dialog":
+                                        prev = _cand
+                                        break
                                 same = (prev is not None and ocr_ok and prev.ocr_ok
                                         and prev.kind == "dialog"
                                         and (prev.content == content_d
@@ -2534,7 +2556,10 @@ class App:
         keep = []
         deleted = 0
         for _number, rec, strong in rows:
-            if (not strong) and (not rec.ocr_ok):
+            # V32:0.7 秒以内又读不出文字的,直接算空行(同上,按"最短真行 0.75 秒"定的线)
+            dur_r = (rec.et - rec.st).total_seconds()
+            if ((not strong) and (not rec.ocr_ok)) or ((not rec.ocr_ok)
+                                                       and dur_r < 0.7):
                 deleted += 1
             else:
                 keep.append(rec)
