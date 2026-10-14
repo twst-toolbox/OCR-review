@@ -1,7 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V27
+V28
+
+V27 -> V28 的改动(圆钮/选项轨重做,治 CH4 那种"满屏假选项"):
+  1. 【修】圆钮模板可以放多张:exe 旁边的 anchor_template*.png 全部读进来,逐张试、
+     取分数最高的那张。起因是游戏换了 UI —— 老圆钮直径约占画面高 9.3%(粗黑环),
+     新 UI 只有 7.6%(细双环),一张模板吃不下两种素材。缩放档位也从 7 档放宽到
+     0.5~2.0 共 10 档;"配不上就自停用"改成看"全部模板的最高分"。
+  2. 【修】选项轨改成"圆钮只认模板匹配":模板在手时,形状判据认出来的圆钮一律不算数
+     (它在花花绿绿的背景、三角色块上会乱认 —— CH4 整片 848 条里 18 条假选项、真选项 0,
+     全是它干的)。一张模板都配不上时,日志会写一行
+     "本片按'没有选项'处理,不再产出选项行",整片就是干净的 0 条。
+     想退回老行为:把 config 里的 choice_require_tpl_anchor 改成 false。
+  3. 配套:build.yml 改成把 anchor_template*.png 一起打进 zip;
+     第二张模板 anchor_template2.png 是从 CH4 后半 1:10:11 那个真选项里裁的。
 
 V26 -> V27 的改动(只加"换台词"判据,别的都没动):
   1. 【修】同一个框里连续换台词时,不再并成一句。实测(参考 1181 条 vs 我们 1121 条):
@@ -256,6 +269,8 @@ DEFAULT_CONFIG = {
     # 搭得上的素材永远不会走到这条。
     "tpl_give_up_tries": 12,
     "tpl_give_up_ratio": 0.70,
+    # V28:选项轨"圆钮只认模板匹配"。关掉才退回老行为(认不出模板时用形状判据凑数)。
+    "choice_require_tpl_anchor": True,
     "row_min_glyphs": 2,
     "row_span_lenient": 0.08,
     # V25:下面两条默认都关。V24 把它们全打开,结果又慢又扫不出东西(选项几乎全丢)。
@@ -735,27 +750,38 @@ def find_anchor(frame, rect_px, content, cfg):
     return None if best is None else best[1]
 
 
-def load_anchor_template():
-    """读 exe 旁边的 anchor_template.png(圆钮小截图)。没有就返回 None,自动退回形状判据。"""
+def load_anchor_templates():
+    """读 exe 旁边的 anchor_template*.png(圆钮小截图),返回 [(文件名, 图像), ...]。
+
+    V28:可以放多张 —— 不同游戏版本/不同播放器的圆钮长得不一样(实测:老 UI 的圆钮直径
+    约占画面高 9.3%,新 UI 只占 7.6%,外圈也从粗黑环变成细双环)。匹配时逐张试、
+    取分数最高的那张。一张都读不到就返回 [],自动退回形状判据。
+    """
+    out = []
     try:
-        path = os.path.join(app_dir(), "anchor_template.png")
-        if not os.path.exists(path):
-            return None
-        buf = np.fromfile(path, dtype=np.uint8)
-        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        if img is None or img.size == 0:
-            return None
-        return img
+        for name in sorted(os.listdir(app_dir())):
+            low = name.lower()
+            if not (low.startswith("anchor_template") and low.endswith(".png")):
+                continue
+            try:
+                buf = np.fromfile(os.path.join(app_dir(), name), dtype=np.uint8)
+                img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            except Exception:
+                img = None
+            if img is not None and img.size:
+                out.append((name, img))
     except Exception:
-        return None
+        return []
+    return out
 
 
-def find_anchor_tpl(frame, rect_px, content, cfg, tpl):
+def find_anchor_tpl(frame, rect_px, content, cfg, tpls):
     """用模板匹配找圆钮 —— 比手写形状规则可靠得多。
 
-    模板按"内容区高度的 9.4%"缩放(圆钮尺寸跟着画面高度走,所以换分辨率也能用),
-    再上下浮动两档,在框左边那块区域里取相似度最高的位置。
-    返回 (位置, 最高分);分数不到 anchor_tpl_min 就不认。
+    可以一次给好几张模板(见 load_anchor_templates):每张都按"内容区高度的 9.4%"缩放,
+    档位放宽到 0.5~2.0 倍共 10 档(不同游戏版本里圆钮大小不一样),在框左边那块区域里
+    取相似度最高的位置,最后留下分数最高的那一张。
+    返回 (位置, 最高分, 命中模板名);分数不到 anchor_tpl_min 就不认。
     """
     try:
         cx0, cy0, cw, chh = content
@@ -765,29 +791,34 @@ def find_anchor_tpl(frame, rect_px, content, cfg, tpl):
         sy0 = int(max(cy0, y - cfg["anchor_search_updown"] * h))
         sy1 = int(min(cy0 + chh, y + h + cfg["anchor_search_updown"] * h))
         if sx1 - sx0 < 40 or sy1 - sy0 < 40:
-            return None, 0.0
+            return None, 0.0, ""
         sub = frame[sy0:sy1, sx0:sx1]
-        th, tw = tpl.shape[:2]
         want = max(8.0, chh * float(cfg.get("anchor_h_ratio", 0.094)))
-        best, best_score = None, 0.0
-        # 缩放档位放宽到 0.55~1.7 倍:模板来自哪个分辨率的截图都能配上,
-        # 以后换素材不用再手动换模板文件。
-        for scale in (want / th * f for f in (0.55, 0.7, 0.85, 1.0, 1.2, 1.45, 1.7)):
-            nw, nh = max(8, int(tw * scale)), max(8, int(th * scale))
-            if nh >= sub.shape[0] or nw >= sub.shape[1]:
+        best, best_score, best_name = None, 0.0, ""
+        # 档位 0.5~2.0(约每档 1.16 倍):老 UI 的圆钮占画面高 9.3%、新 UI 只占 7.6%,
+        # 模板本身又是从别的截图裁的,所以宁可多试几档。多试的代价由"配不上就自停用"兜住。
+        for tname, tpl in tpls:
+            th, tw = tpl.shape[:2]
+            if th < 6 or tw < 6:
                 continue
-            t = cv2.resize(tpl, (nw, nh),
-                           interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
-            res = cv2.matchTemplate(sub, t, cv2.TM_CCOEFF_NORMED)
-            _mn, mx, _ml, ml = cv2.minMaxLoc(res)
-            if float(mx) > best_score:
-                best_score = float(mx)
-                best = (sx0 + int(ml[0]), sy0 + int(ml[1]), nw, nh)
-        if best is None or best_score < float(cfg.get("anchor_tpl_min", 0.60)):
-            return None, best_score
-        return best, best_score
+            for f in (0.50, 0.58, 0.68, 0.79, 0.92, 1.07, 1.25, 1.45, 1.70, 2.00):
+                scale = want / th * f
+                nw, nh = max(8, int(tw * scale)), max(8, int(th * scale))
+                if nh >= sub.shape[0] or nw >= sub.shape[1]:
+                    continue
+                t = cv2.resize(tpl, (nw, nh),
+                               interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+                res = cv2.matchTemplate(sub, t, cv2.TM_CCOEFF_NORMED)
+                _mn, mx, _ml, ml = cv2.minMaxLoc(res)
+                if float(mx) > best_score:
+                    best_score = float(mx)
+                    best = (sx0 + int(ml[0]), sy0 + int(ml[1]), nw, nh)
+                    best_name = tname
+        if best is None or best_score < float(cfg.get("anchor_tpl_min", 0.75)):
+            return None, best_score, best_name
+        return best, best_score, best_name
     except Exception:
-        return None, 0.0
+        return None, 0.0, ""
 
 
 def detect_content_area(frames, width, height):
@@ -1706,11 +1737,12 @@ class App:
             verbose = bool(self.var_verbose.get())
             require_anchor = dark_on_light or bool(cfg["require_anchor_in_white_mode"])
             use_choice_track = bool(self.var_choice.get())
-            c_anchor_tpl = load_anchor_template()
+            c_anchor_tpls = load_anchor_templates()
             cfg["require_text_row"] = bool(self.var_row.get())
-            self.log("ℹ️ 圆钮: %s" % ("模板匹配(已载入 anchor_template.png)"
-                                     if c_anchor_tpl is not None
-                                     else "形状判据(没找到 anchor_template.png)"))
+            self.log("ℹ️ 圆钮: %s" % (
+                "模板匹配(已载入 %d 张: %s)"
+                % (len(c_anchor_tpls), ", ".join(n for n, _ in c_anchor_tpls))
+                if c_anchor_tpls else "形状判据(没找到 anchor_template*.png)"))
             drop_unreadable_choice = bool(cfg.get("drop_unreadable_choice", True))
 
             cap = cv2.VideoCapture(self.video_path)
@@ -1820,6 +1852,7 @@ class App:
             # V26:模板"自杀"用的三本账(每次运行重新计)
             c_tpl_tries = 0
             c_tpl_best = 0.0
+            c_tpl_best_name = ""
             c_tpl_off = False
 
             anchor_every = max(1, int(cfg.get("anchor_every", 3)))
@@ -2007,37 +2040,41 @@ class App:
                         # 有模板时只在"上一帧泡泡判定通过"的帧才去匹配(匹配偏贵),
                         # 平时根本不会走到这里。
                         if c_anchor_cache is None or idx % anchor_every == 0:
-                            if (c_anchor_tpl is None or c_last_bubble_ok
+                            if (not c_anchor_tpls or c_last_bubble_ok
                                     or c_anchor_cache is None):
-                                # V26:模板被判定"配不上本素材"之后,只在每 3000 帧白试一次;
-                                # 平时直接走形状判据 —— 省掉每帧 7 个缩放档的模板比对。
-                                use_tpl = (c_anchor_tpl is not None
+                                # V26:所有模板都被判定"配不上本素材"之后,只在每 3000 帧白试一次;
+                                # 平时直接走形状判据 —— 省掉每帧十几档的模板比对。
+                                use_tpl = (bool(c_anchor_tpls)
                                            and (not c_tpl_off or idx % 3000 == 0))
                                 if use_tpl:
-                                    c_anchor_cache, tpl_score = find_anchor_tpl(
-                                        frame, rect_c, content, cfg, c_anchor_tpl)
+                                    c_anchor_cache, tpl_score, tpl_name = find_anchor_tpl(
+                                        frame, rect_c, content, cfg, c_anchor_tpls)
                                     if tpl_score:
                                         c_tpl_tries += 1
                                         if tpl_score > c_tpl_best:
                                             c_tpl_best = tpl_score
+                                            c_tpl_best_name = tpl_name
                                         if (not c_tpl_off
                                                 and c_tpl_tries >= int(cfg.get(
                                                     "tpl_give_up_tries", 12))
                                                 and c_tpl_best < tpl_min * float(cfg.get(
                                                     "tpl_give_up_ratio", 0.70))):
                                             c_tpl_off = True
-                                            self.log("🔍 模板配不上本素材(最高分 %.2f,阈值 %.2f)"
-                                                     " → 停用模板匹配,改用形状判据(速度回到 V23 那档)"
-                                                     % (c_tpl_best, tpl_min))
-                                    if c_anchor_cache is None:
-                                        # 模板在这个素材上没配上(你的 1280x720 那版最高才 0.39),
-                                        # 这时退回"形状判据"(V22 修好的 fill 0.08~0.45 那套)。
-                                        # 注意:V22~V24 里这条回退是死的 —— 因为模板文件总是存在,
-                                        # 修好的形状判据从来没被用到过。
+                                            self.log("🔍 %d 张圆钮模板都配不上本素材(最高分"
+                                                     " %.2f,阈值 %.2f) → 本片按'没有选项'处理,"
+                                                     "不再产出选项行"
+                                                     % (len(c_anchor_tpls), c_tpl_best,
+                                                        tpl_min))
+                                    if c_anchor_cache is None and not cfg.get(
+                                            "choice_require_tpl_anchor", True):
+                                        # V28:默认不再用形状判据兜底 —— 实测它在花花绿绿的背景、
+                                        # 三角色块上会乱认(CH4 整片 18 条假选项全是它认出来的)。
+                                        # 只有把 choice_require_tpl_anchor 关掉才退回老行为。
                                         c_anchor_cache = find_anchor(frame, rect_c, content,
                                                                      cfg)
                                     if verbose and tpl_score and idx % 600 == 0:
-                                        self.log("   🔍 模板匹配最高分 %.2f" % tpl_score)
+                                        self.log("   🔍 圆钮模板最高分 %.2f (%s)"
+                                                 % (tpl_score, tpl_name))
                                 else:
                                     c_anchor_cache = find_anchor(frame, rect_c, content,
                                                                  cfg)
@@ -2070,8 +2107,14 @@ class App:
                         is_choice = (bool(c_info["ok"])
                                      and density_c >= cfg["choice_start_density"])
                         if is_choice and anchor is None:
-                            is_choice = text_row_ok(roi_c, dark_on_light, thr,
-                                                    content_h, cfg)
+                            # V28:有模板时"圆钮只认模板匹配"。认不出圆钮就不算选项 ——
+                            # 宁可漏掉几个真选项,也别像 CH4 那样满屏 18 条假选项。
+                            if (c_anchor_tpls
+                                    and cfg.get("choice_require_tpl_anchor", True)):
+                                is_choice = False
+                            else:
+                                is_choice = text_row_ok(roi_c, dark_on_light, thr,
+                                                        content_h, cfg)
                     else:
                         is_choice = (bool(c_info["ok"]) and anchor_ok
                                      and density_c >= cfg["choice_start_density"])
