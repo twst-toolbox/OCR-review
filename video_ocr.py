@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V33
+V34
+
+V33 -> V34 的改动(抽查再瘦一圈 —— 这才是 CH1 慢的真凶):
+  1. 【快】抽查(cheap 模式)不再扫整块搜索区,只看**选项气泡左边那条窄带**
+     (x: 框左 -0.20w ~ 框左 +0.35w,y: 上下各留 0.2h)。圆钮永远长在气泡左边缘,
+     所以这条窄带足够;搜索面积从 ~600×550 降到 ~360×290,比对代价降 5 倍以上。
+     V33 虽然把抽查间隔拉到 1.5 秒,但每次都还在扫整块 —— 日志实测:开头 57~123 帧/秒,
+     "配不上→开始抽查"之后掉到 9~15 帧/秒,一晚上只跑到 21%。
+  2. 【稳】抽查每 5 次里有 1 次仍用完整搜索区,免得某些版面的圆钮正好落在窄带之外。
+  3. 【调】抽查间隔 1.5 秒 → 2.5 秒(真选项画面会停留好几秒,够抓到)。
 
 V32 -> V33 的改动(把"抽查圆钮"变得真的便宜 —— CH1 卡一整夜就是它):
   1. 【快】抽查间隔 0.5 秒 → 1.5 秒;
@@ -836,10 +845,18 @@ def find_anchor_tpl(frame, rect_px, content, cfg, tpls, cheap=False):
     try:
         cx0, cy0, cw, chh = content
         x, y, w, h = rect_px
-        sx0 = int(max(cx0, x - cfg["anchor_search_left"] * w))
-        sx1 = int(min(cx0 + cw, x + w * 0.5))
-        sy0 = int(max(cy0, y - cfg["anchor_search_updown"] * h))
-        sy1 = int(min(cy0 + chh, y + h + cfg["anchor_search_updown"] * h))
+        if cheap:
+            # V34:抽查只扫"气泡左边那条窄带" —— 圆钮永远在气泡左边缘,
+            # 这一条把抽查的代价降了 5 倍以上,是让"整片没有选项"的素材恢复速度的关键。
+            sx0 = int(max(cx0, x - w * 0.20))
+            sx1 = int(min(cx0 + cw, x + w * 0.35))
+            sy0 = int(max(cy0, y - h * 0.20))
+            sy1 = int(min(cy0 + chh, y + h * 1.20))
+        else:
+            sx0 = int(max(cx0, x - cfg["anchor_search_left"] * w))
+            sx1 = int(min(cx0 + cw, x + w * 0.5))
+            sy0 = int(max(cy0, y - cfg["anchor_search_updown"] * h))
+            sy1 = int(min(cy0 + chh, y + h + cfg["anchor_search_updown"] * h))
         if sx1 - sx0 < 40 or sy1 - sy0 < 40:
             return None, 0.0, ""
         sub = frame[sy0:sy1, sx0:sx1]
@@ -2202,7 +2219,7 @@ class App:
                                 # (选项画面一般会停留好几秒)。
                                 # V33:抽查要便宜 —— 间隔拉到 1.5 秒,而且只在"选项框像泡泡"时
                                 # 才抽(没选项的素材里几乎不会发生),抽查本身也用 cheap 模式。
-                                probe_every = max(anchor_every, int(round(fps * 1.5)))
+                                probe_every = max(anchor_every, int(round(fps * 2.5)))
                                 use_tpl = (bool(c_anchor_tpls)
                                            and (not c_tpl_off
                                                 or (idx % probe_every == 0
@@ -2210,7 +2227,9 @@ class App:
                                 if use_tpl:
                                     c_anchor_cache, tpl_score, tpl_name = find_anchor_tpl(
                                         frame, rect_c, content, cfg, c_anchor_tpls,
-                                        cheap=c_tpl_off)
+                                        # 每 5 次抽查里有 1 次用完整搜索区兜底
+                                        cheap=(c_tpl_off
+                                               and idx % (probe_every * 5) != 0))
                                     if tpl_score:
                                         c_tpl_tries += 1
                                         if tpl_score > c_tpl_best:
