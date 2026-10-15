@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V32
+V33
+
+V32 -> V33 的改动(把"抽查圆钮"变得真的便宜 —— CH1 卡一整夜就是它):
+  1. 【快】抽查间隔 0.5 秒 → 1.5 秒;
+  2. 【快】只在**选项框本身看着像泡泡**时才抽查。整片没有选项的素材,这一条几乎让抽查不再
+     发生 —— 之前每 0.5 秒就全档比对一次(搜索区 600×550、模板放大到 90px,单次几百毫秒
+     到一两秒),相当于把整条流水线的速度按在地上。实测:CH4 前期 66 分钟的片子跑了 143 分钟
+     (13~23 帧/秒),CH1 更是整夜没跑完;
+  3. 【快】抽查只用 3 个中间档缩放(0.68/0.92/1.25),真选项靠"恢复全速"后再精查。
 
 V31 -> V32 的改动(复核删得更干净 + 缝合不再被假选项挡住):
   1. 【修】复核删"空行"再放宽一档:短行(<0.7 秒)只要读不出文字就删,不管它长得像不像
@@ -817,7 +825,7 @@ def load_anchor_templates():
     return out
 
 
-def find_anchor_tpl(frame, rect_px, content, cfg, tpls):
+def find_anchor_tpl(frame, rect_px, content, cfg, tpls, cheap=False):
     """用模板匹配找圆钮 —— 比手写形状规则可靠得多。
 
     可以一次给好几张模板(见 load_anchor_templates):每张都按"内容区高度的 9.4%"缩放,
@@ -846,7 +854,9 @@ def find_anchor_tpl(frame, rect_px, content, cfg, tpls):
             th, tw = tpl.shape[:2]
             if th < 6 or tw < 6:
                 continue
-            for f in (0.50, 0.58, 0.68, 0.79, 0.92, 1.07, 1.25, 1.45):
+            scales = ((0.68, 0.92, 1.25) if cheap      # V33:抽查模式只试中间 3 档
+                      else (0.50, 0.58, 0.68, 0.79, 0.92, 1.07, 1.25, 1.45))
+            for f in scales:
                 scale = want / th * f
                 nw, nh = max(8, int(tw * scale)), max(8, int(th * scale))
                 if nh >= sub.shape[0] or nw >= sub.shape[1]:
@@ -2190,13 +2200,17 @@ class App:
                                 # 全部模板都"从没到过阈值"之后降频到每 0.5 秒试一次:
                                 # 既不拖速度,又不至于漏掉"整片只有一两个选项"的片子
                                 # (选项画面一般会停留好几秒)。
-                                probe_every = max(anchor_every, int(round(fps * 0.5)))
+                                # V33:抽查要便宜 —— 间隔拉到 1.5 秒,而且只在"选项框像泡泡"时
+                                # 才抽(没选项的素材里几乎不会发生),抽查本身也用 cheap 模式。
+                                probe_every = max(anchor_every, int(round(fps * 1.5)))
                                 use_tpl = (bool(c_anchor_tpls)
                                            and (not c_tpl_off
-                                                or idx % probe_every == 0))
+                                                or (idx % probe_every == 0
+                                                    and c_last_bubble_ok)))
                                 if use_tpl:
                                     c_anchor_cache, tpl_score, tpl_name = find_anchor_tpl(
-                                        frame, rect_c, content, cfg, c_anchor_tpls)
+                                        frame, rect_c, content, cfg, c_anchor_tpls,
+                                        cheap=c_tpl_off)
                                     if tpl_score:
                                         c_tpl_tries += 1
                                         if tpl_score > c_tpl_best:
