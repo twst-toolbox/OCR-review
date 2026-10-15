@@ -1,7 +1,24 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V34
+V36
+
+V35 -> V36 的改动(让"整片没有选项"回到 V25 那档速度 —— 这才是那条视频变慢的根):
+  1. 【快】放弃圆钮模板之后,不再"每 2.5 秒盲目全档比对一次",而是先用**形状判据**
+     当便宜的筛子(它只看圆环的暗度/长宽比/尺寸,几毫秒级),筛到了才用模板确认。
+     没有选项的素材里几乎没有圆环,于是这条链几乎不花时间 —— 这正是 V25 时代的成本,
+     也就是同一支视频当时能跑 47~138 帧/秒的原因。
+  2. 【稳】模板确认通过就恢复全速查找(原有逻辑不变);另外每 10 秒盲扫一次兜底,
+     以防某个版面的圆钮连形状筛子都过不了。
+  3. 注意:形状判据在这里**只当筛子**,它自己认出来的结果永远不算"有圆钮" ——
+     这一点沿用 V28 的规则,否则花花绿绿的背景又会造假选项。
+
+V34 -> V35 的改动(改成灰度匹配 —— 治"选项被选中时圆钮变灰"):
+  1. 【修】圆钮匹配从"彩色"换成"灰度"。用户截图实测:选项被选中时,那颗圆钮会被压成
+     深灰单色(金色圆环+黑三角变成灰环+白三角),彩色模板在那种帧上只有 0.50 分,
+     永远过不了 0.75 —— 于是"整片没有选项"的误判就这么来的。
+     灰度只看形状(圆环 + 三角),对配色不敏感,选中/未选中都能配上。
+  2. 【快】顺带:通道数 3 → 1,matchTemplate 的代价直接降到约 1/3。
 
 V33 -> V34 的改动(抽查再瘦一圈 —— 这才是 CH1 慢的真凶):
   1. 【快】抽查(cheap 模式)不再扫整块搜索区,只看**选项气泡左边那条窄带**
@@ -860,6 +877,13 @@ def find_anchor_tpl(frame, rect_px, content, cfg, tpls, cheap=False):
         if sx1 - sx0 < 40 or sy1 - sy0 < 40:
             return None, 0.0, ""
         sub = frame[sy0:sy1, sx0:sx1]
+        # V35:灰度匹配 —— 选项被选中时圆钮会被压成深灰单色(实测只有 0.50 分),
+        # 彩色模板根本认不出来;灰度只看形状,而且通道数少 2/3,比对快约 3 倍。
+        try:
+            if sub.ndim == 3:
+                sub = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            pass
         want = max(8.0, chh * float(cfg.get("anchor_h_ratio", 0.094)))
         best, best_score, best_name = None, 0.0, ""
         # 档位 0.5~2.0(约每档 1.16 倍):老 UI 的圆钮占画面高 9.3%、新 UI 只占 7.6%,
@@ -868,6 +892,11 @@ def find_anchor_tpl(frame, rect_px, content, cfg, tpls, cheap=False):
         # 而圆钮只占画面高 6~10%,根本用不到超大档)。
         area_lim = sub.shape[0] * sub.shape[1] * 0.15
         for tname, tpl in tpls:
+            if tpl.ndim == 3:
+                try:
+                    tpl = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
+                except Exception:
+                    pass
             th, tw = tpl.shape[:2]
             if th < 6 or tw < 6:
                 continue
@@ -2214,16 +2243,18 @@ class App:
                                   else anchor_every) == 0:
                             if (not c_anchor_tpls or c_last_bubble_ok
                                     or c_anchor_cache is None):
-                                # 全部模板都"从没到过阈值"之后降频到每 0.5 秒试一次:
-                                # 既不拖速度,又不至于漏掉"整片只有一两个选项"的片子
-                                # (选项画面一般会停留好几秒)。
-                                # V33:抽查要便宜 —— 间隔拉到 1.5 秒,而且只在"选项框像泡泡"时
-                                # 才抽(没选项的素材里几乎不会发生),抽查本身也用 cheap 模式。
                                 probe_every = max(anchor_every, int(round(fps * 2.5)))
-                                use_tpl = (bool(c_anchor_tpls)
-                                           and (not c_tpl_off
-                                                or (idx % probe_every == 0
-                                                    and c_last_bubble_ok)))
+                                if c_tpl_off:
+                                    # V36:模板已经放弃 → 先用形状判据(几毫秒)当筛子,
+                                    # 只有它报"有圆环"时才动用模板确认。没选项的素材里
+                                    # 几乎不会中,速度就回到了 V25 那档。
+                                    gate = find_anchor(frame, rect_c, content, cfg)
+                                    use_tpl = bool(c_anchor_tpls) and (
+                                        gate is not None
+                                        or (idx % (probe_every * 4) == 0
+                                            and c_last_bubble_ok))
+                                else:
+                                    use_tpl = bool(c_anchor_tpls)
                                 if use_tpl:
                                     c_anchor_cache, tpl_score, tpl_name = find_anchor_tpl(
                                         frame, rect_c, content, cfg, c_anchor_tpls,
