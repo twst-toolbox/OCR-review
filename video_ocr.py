@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V36
+V37
+
+V36 -> V37 的改动(圆钮查找只在"选项框像气泡"的帧上做 —— 治场景切换变慢):
+  1. 【快】去掉了守卫里的 `or 缓存为空`。旧写法等于"只要还没找到圆钮,每 3 帧就查一次",
+     而形状筛子在画面热闹(暗块多、连通域多)时会明显变贵 —— 用户实测"每次到 2 分多钟
+     场景切换时就变慢"就是这个。
+     现在:只有**上一帧选项框的泡泡判定通过**时才会去找圆钮(真选项画面必然满足),
+     平时(对话画面)这一步完全不发生。
+  2. 【修】这条同时让"选项框只盖住深色/被选中那颗气泡"的问题暴露出来 —— 深色气泡过不了
+     泡泡判定,于是圆钮永远查不到。请在预览里把选项框**拉大到盖住所有选项气泡**。
 
 V35 -> V36 的改动(让"整片没有选项"回到 V25 那档速度 —— 这才是那条视频变慢的根):
   1. 【快】放弃圆钮模板之后,不再"每 2.5 秒盲目全档比对一次",而是先用**形状判据**
@@ -2241,8 +2250,10 @@ class App:
                         warm_every = max(anchor_every, int(round(fps * 0.15)))
                         if idx % (warm_every if c_anchor_cache is not None
                                   else anchor_every) == 0:
-                            if (not c_anchor_tpls or c_last_bubble_ok
-                                    or c_anchor_cache is None):
+                            # V37:只有"选项框看着像气泡"的帧才值得去找圆钮 ——
+                            # 以前那个 `or 缓存为空` 让它每 3 帧都查一次,画面一热闹
+                            # (暗块/连通域多)形状筛子就变贵,表现为"场景切换时突然变慢"。
+                            if not c_anchor_tpls or c_last_bubble_ok:
                                 probe_every = max(anchor_every, int(round(fps * 2.5)))
                                 if c_tpl_off:
                                     # V36:模板已经放弃 → 先用形状判据(几毫秒)当筛子,
