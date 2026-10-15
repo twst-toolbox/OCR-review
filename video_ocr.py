@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V39
+V40
+
+V39 -> V40 的改动(V39 那个 0.55 其实没生效,这里修掉):
+  1. 【修】V39 只改了 `similar_prefix()` 的默认参数,但真正调用时传的是
+     `cfg["merge_prefix_ratio"]`(默认配置里写的是 0.7)—— 所以 0.55 根本没起作用,
+     V39 那轮的数字和 V38 基本一致就是这个原因。现在把**默认配置**里的
+     merge_prefix_ratio 也改成 0.55,两边一致。
+     (用户从 zip 临时目录运行,config 每次都按默认值重新生成,所以这一改立刻生效。)
 
 V38 -> V39 的改动(只调一个数:缝合门槛 0.7 → 0.55):
   1. 【修】"打字机碎句"的缝合门槛从"开头 70% 一致"放宽到"55%"。
@@ -312,7 +319,9 @@ DEFAULT_CONFIG = {
     "choice_still_seconds": 0.30,
     "choice_absent_seconds": 0.35,
     "motion_cut_stable_frames": 3,
-    "merge_prefix_ratio": 0.7,
+    # V40:缝合门槛 0.55 —— 同一句因"重新排版"被切成两段时,共同前缀常在 57~62%,
+    # 原来的 0.7 接不回去,留下重复行。
+    "merge_prefix_ratio": 0.55,
     "drop_unreadable_choice": False,
     "choice_min_jp_chars": 2,
     "choice_max_tries": 3,
