@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V40
+V41
+
+V40 -> V41 的改动(复核只删"短的"空行,长的留着给你手补):
+  1. 【改】复核的删除规则简化成一条:**读不出文字 且 时长 < `check_min_seconds`
+     (默认 0.75 → 现在按用户实测改成 1.5 秒)** 才删。
+     旧的判断还带着"严格判据没看到文字行就算空行",结果把 2~4.5 秒的 `Line N` 占位行
+     也一起删了 —— 那些正是"这里原本有句话、只是 OCR 没读出来"的手补线索 ✗。
+     现在:短的一闪而过的空白行照删(星尘/反光那类噪声),长的占位行全部保留 ✓
+  2. 【对齐】`check_min_seconds` 0.5 → 1.5(用户印象里空行都是一闪而过的,1.5 秒足够)。
+     想再收紧/放宽,改 config 里这一个值即可。
+  3. 删除前仍然先写 .bak,报告里照样列出被删的行。
 
 V39 -> V40 的改动(V39 那个 0.55 其实没生效,这里修掉):
   1. 【修】V39 只改了 `similar_prefix()` 的默认参数,但真正调用时传的是
@@ -334,7 +344,9 @@ DEFAULT_CONFIG = {
     "check_min_glyphs": 2,
     "check_span_ratio": 0.08,
     "check_ocr_frames": 4,
-    "check_min_seconds": 0.5,
+    # V41:1.5 秒 —— 复核只删"读不出文字、又比这个还短"的空行;
+    # 比它长的空行(Line N 占位)一律留着当手补线索。
+    "check_min_seconds": 1.5,
     "check_kill_short": True,
     "still_diff": 0.001,
     "choice_start_density": 0.004,
@@ -1762,14 +1774,12 @@ class App:
                 rows.append({"n": i + 1, "t0": t0, "t1": t1, "text": text,
                              "choice": "[Choice]" in text,
                              "short": too_short,
-                             # 实测最短的真行是 0.75 秒(只有音效),所以 <0.5 秒基本是误判
-                             "alive": (((hit > 0) or bool(ocr_text))
-                                       and not (too_short
-                                                and cfg.get("check_kill_short", True))
-                                       # V32:0.7 秒以内、又读不出文字的,直接算空行
-                                       # (程序自己的注释:实测最短的真行是 0.75 秒)
-                                       and not (not ocr_text and dur_line < 0.7
-                                                and cfg.get("check_kill_short", True))),
+                             # V41:删除条件就一条 —— **读不出文字 且 比 check_min_seconds
+                             # (默认 1.5 秒)短** 才算空行。旧版还额外用"严格判据没看到文字行"
+                             # 当条件,把 2~4.5 秒的 Line N 占位行也删了 ✗,那些是手补线索。
+                             "alive": (bool(ocr_text)
+                                       or dur_line >= float(cfg["check_min_seconds"])
+                                       or not cfg.get("check_kill_short", True)),
                              "hit": hit, "tried": tried, "ocr": ocr_text, "shot": shot})
             dead = [r for r in rows if not r["alive"]]
             dead_dialog = [r for r in dead if not r["choice"]]
@@ -2650,10 +2660,11 @@ class App:
         keep = []
         deleted = 0
         for _number, rec, strong in rows:
-            # V32:0.7 秒以内又读不出文字的,直接算空行(同上,按"最短真行 0.75 秒"定的线)
+            # V41:同一条规则 —— 读不出文字、且短于 check_min_seconds(1.5 秒)才删
+            # (长的是"这里原本有句话"的手补线索,一律保留)
             dur_r = (rec.et - rec.st).total_seconds()
-            if ((not strong) and (not rec.ocr_ok)) or ((not rec.ocr_ok)
-                                                       and dur_r < 0.7):
+            if ((not rec.ocr_ok) and dur_r < float(cfg["check_min_seconds"])
+                    and cfg.get("check_kill_short", True)):
                 deleted += 1
             else:
                 keep.append(rec)
