@@ -1,7 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Video Subtitle Extractor  --  TWST / 18TRIP 打轴 + Windows 自带 OCR
-V41
+V42
+
+V41 -> V42 的改动:
+  1. 【修】复核判"空行"改成**看内容里有没有日文**,不再看内部的 ocr_ok 标志 ——
+     上一轮实测有 8 条明明读出了日文(「こは」「ガコンツ!」「ええっ」这类短句/音效),
+     却因为标志没置上被当成空行删掉 ✗。现在只有"内容里没有日文 且 短于
+     check_min_seconds(1.5 秒)"才删。
+  2. 【便】日志第一行打印**代码版本**(写在本文件里的 CODE_VERSION),不再只依赖
+     build.yml 生成的版本号 —— 根治"以为传了新版、其实跑的是旧代码"(V41 那轮的乌龙)。
+  3. 【净】去掉「18TRIP (白字)」单选按钮(朋友那边的需求没了)。白字分支的代码保留,
+     以后要恢复只需加回一行。
+  4. 待办(V43):① 覆盖前把旧文件归档成「名字 (1).ext」;② 「🧹 清理截图」按钮。
 
 V40 -> V41 的改动(复核只删"短的"空行,长的留着给你手补):
   1. 【改】复核的删除规则简化成一条:**读不出文字 且 时长 < `check_min_seconds`
@@ -292,6 +303,8 @@ except Exception:
     APP_VERSION, BUILD_DATE = "V13-dev", "2026-10-11"
 
 APP_NAME = "Video Subtitle Extractor"
+# V42:代码版本写在代码里,日志第一行打印它 —— 免得"build.yml 说是新版、其实是旧代码"
+CODE_VERSION = "V42"
 
 HAS_WIN_OCR = False
 try:
@@ -1165,6 +1178,7 @@ class App:
         else:
             self.drop_ok = False
         self.log("ℹ️ 版本 %s / 构建 %s" % (APP_VERSION, BUILD_DATE))
+        self.log("ℹ️ 代码版本: %s（窗口标题里的版本号来自 CI，可能和它对不上）" % CODE_VERSION)
         self.log("ℹ️ 参数文件: %s" % os.path.join(app_dir(), "video_ocr_config.json"))
         self.log("ℹ️ 拖拽: %s" % ("已启用" if self.drop_ok else "不可用(用按钮加载也一样)"))
         self.root.after(120, self._drain_log)
@@ -1235,8 +1249,6 @@ class App:
         tk.Label(f_top2, text="模式:", font=("微软雅黑", 10, "bold")).pack(side=tk.LEFT)
         tk.Radiobutton(f_top2, text="TWST (黑字)", variable=self.var_mode,
                        value="BLACK").pack(side=tk.LEFT)
-        tk.Radiobutton(f_top2, text="18TRIP (白字)", variable=self.var_mode,
-                       value="WHITE").pack(side=tk.LEFT, padx=10)
 
         _dm = str(self.cfg.get("detect_mode", "bubble"))
         init_detect = ("泡泡判定" if _dm.startswith("bub")
@@ -1777,7 +1789,9 @@ class App:
                              # V41:删除条件就一条 —— **读不出文字 且 比 check_min_seconds
                              # (默认 1.5 秒)短** 才算空行。旧版还额外用"严格判据没看到文字行"
                              # 当条件,把 2~4.5 秒的 Line N 占位行也删了 ✗,那些是手补线索。
-                             "alive": (bool(ocr_text)
+                             # V42:判"空行"看内容里有没有日文(不看 ocr_ok 标志)——
+                             # 上一轮有 8 条读出了日文的短句被误删,就是标志没置上导致的。
+                             "alive": (jp_char_count(text) >= 2
                                        or dur_line >= float(cfg["check_min_seconds"])
                                        or not cfg.get("check_kill_short", True)),
                              "hit": hit, "tried": tried, "ocr": ocr_text, "shot": shot})
@@ -2663,7 +2677,9 @@ class App:
             # V41:同一条规则 —— 读不出文字、且短于 check_min_seconds(1.5 秒)才删
             # (长的是"这里原本有句话"的手补线索,一律保留)
             dur_r = (rec.et - rec.st).total_seconds()
-            if ((not rec.ocr_ok) and dur_r < float(cfg["check_min_seconds"])
+            # V42:同一条 —— 内容里没有日文、且短于 check_min_seconds 才删
+            if (jp_char_count(rec.content) < 2
+                    and dur_r < float(cfg["check_min_seconds"])
                     and cfg.get("check_kill_short", True)):
                 deleted += 1
             else:
